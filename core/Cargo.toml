@@ -1,0 +1,10 @@
+[package]
+name = "core"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "marceline_core"
+path = "src/lib.rs"
+
+[dependencies]
