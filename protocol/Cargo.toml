@@ -1,0 +1,10 @@
+[package]
+name = "protocol"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "marceline_protocol"
+path = "src/lib.rs"
+
+[dependencies]
