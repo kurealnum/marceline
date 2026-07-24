@@ -1,0 +1,5 @@
+# Pinned deps for the Python worker template.
+# Real workers (STT, TTS, ...) copy this file and add model-specific deps
+# (torch, transformers, etc.) below the line.
+grpcio==1.66.2
+grpcio-health-checking==1.66.2
