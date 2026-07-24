@@ -1,0 +1,20 @@
+[package]
+name = "core"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "marceline_core"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["process", "rt-multi-thread", "macros", "sync", "time", "net"] }
+tonic = "0.12"
+tonic-health = "0.12"
+tower = "0.4"
+hyper-util = { version = "0.1", features = ["tokio"] }

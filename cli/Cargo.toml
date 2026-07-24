@@ -1,0 +1,13 @@
+[package]
+name = "cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "marceline"
+path = "src/main.rs"
+
+[dependencies]
+core = { path = "../core" }
+tracing = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync"] }

@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+// Streaming text-to-speech contract (SPEC.md §2.4.1, EPIC 0.5): segmented
+// text in, PCM audio chunks out.
+package marceline.tts;
+
+import "common.proto";
+
+// Bidirectional-streaming TTS service hosted by the Python TTS worker.
+service Tts {
+  // Streams already-segmented text in (sentence-chunking is the caller's
+  // job, §5.3), streams audio chunks out. The client interleaves `Cancel`
+  // messages on the request stream to stop in-flight synthesis
+  // cooperatively (§2.5.1).
+  rpc Synthesize(stream TtsRequest) returns (stream TtsResponse);
+}
+
+// One message on the client-to-server request stream.
+message TtsRequest {
+  oneof payload {
+    // A pre-segmented span of text to synthesize.
+    string text = 1;
+    // Cooperative cancel signal; worker returns early between decode steps.
+    marceline.common.Cancel cancel = 2;
+  }
+}
+
+// One message on the server-to-client response stream: a chunk of
+// synthesized PCM audio.
+message TtsResponse {
+  marceline.common.AudioChunk audio = 1;
+}

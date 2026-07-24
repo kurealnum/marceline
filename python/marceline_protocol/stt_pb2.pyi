@@ -1,0 +1,31 @@
+import common_pb2 as _common_pb2
+from google.protobuf import descriptor as _descriptor
+from google.protobuf import message as _message
+from collections.abc import Mapping as _Mapping
+from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
+
+DESCRIPTOR: _descriptor.FileDescriptor
+
+class SttRequest(_message.Message):
+    __slots__ = ("audio", "cancel")
+    AUDIO_FIELD_NUMBER: _ClassVar[int]
+    CANCEL_FIELD_NUMBER: _ClassVar[int]
+    audio: _common_pb2.AudioChunk
+    cancel: _common_pb2.Cancel
+    def __init__(self, audio: _Optional[_Union[_common_pb2.AudioChunk, _Mapping]] = ..., cancel: _Optional[_Union[_common_pb2.Cancel, _Mapping]] = ...) -> None: ...
+
+class SttResponse(_message.Message):
+    __slots__ = ("partial", "final")
+    PARTIAL_FIELD_NUMBER: _ClassVar[int]
+    FINAL_FIELD_NUMBER: _ClassVar[int]
+    partial: str
+    final: FinalTranscript
+    def __init__(self, partial: _Optional[str] = ..., final: _Optional[_Union[FinalTranscript, _Mapping]] = ...) -> None: ...
+
+class FinalTranscript(_message.Message):
+    __slots__ = ("text", "confidence")
+    TEXT_FIELD_NUMBER: _ClassVar[int]
+    CONFIDENCE_FIELD_NUMBER: _ClassVar[int]
+    text: str
+    confidence: float
+    def __init__(self, text: _Optional[str] = ..., confidence: _Optional[float] = ...) -> None: ...

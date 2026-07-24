@@ -1,0 +1,6 @@
+/target
+
+# Python worker venvs / bytecode
+.venv/
+__pycache__/
+*.pyc
