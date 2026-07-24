@@ -5,7 +5,7 @@ use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use marceline_core::{HealthView, Supervisor, WorkerSpec};
+use marceline_core::{Device, HealthView, Supervisor, WorkerSpec};
 use tokio::sync::{watch, RwLock};
 
 fn main() {
@@ -46,7 +46,9 @@ async fn run(verbose: bool) {
         script: PathBuf::from(env_or("WORKER_SCRIPT", "workers/template/worker.py")),
         socket_path: PathBuf::from(env_or("WORKER_SOCKET", "/tmp/marceline-worker.sock")),
         model_id: env_or("WORKER_MODEL_ID", "template"),
-        device: env_or("WORKER_DEVICE", "cpu"),
+        device: env_or("WORKER_DEVICE", "cpu")
+            .parse::<Device>()
+            .expect("WORKER_DEVICE must be a supported device"),
     };
 
     let health: HealthView = Arc::new(RwLock::new(HashMap::new()));

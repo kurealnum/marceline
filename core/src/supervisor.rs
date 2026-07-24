@@ -17,6 +17,8 @@ use tonic_health::pb::health_client::HealthClient;
 use tonic_health::pb::HealthCheckRequest;
 use tower::service_fn;
 
+use crate::device::Device;
+
 /// Initial delay before the first restart attempt; doubles on each
 /// consecutive crash up to [`MAX_BACKOFF`].
 const INITIAL_BACKOFF: Duration = Duration::from_millis(200);
@@ -42,8 +44,10 @@ pub struct WorkerSpec {
     pub socket_path: PathBuf,
     /// Model identifier passed to the worker.
     pub model_id: String,
-    /// Compute device passed to the worker.
-    pub device: String,
+    /// Compute device passed to the worker. Routed through [`Device`] so no
+    /// call site here hardcodes a device string (EPIC 0.7); only
+    /// `Device::as_str` knows the wire representation.
+    pub device: Device,
 }
 
 impl WorkerSpec {
@@ -57,7 +61,7 @@ impl WorkerSpec {
             .arg("--model-id")
             .arg(&self.model_id)
             .arg("--device")
-            .arg(&self.device);
+            .arg(self.device.as_str());
         cmd
     }
 }
