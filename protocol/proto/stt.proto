@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+// Streaming speech-to-text contract (SPEC.md §2.4.1, EPIC 0.5): audio
+// frames in, incremental + final transcripts out.
+package marceline.stt;
+
+import "common.proto";
+
+// Bidirectional-streaming STT service hosted by the Python STT worker.
+service Stt {
+  // Streams audio in, streams transcripts out. The client interleaves
+  // `Cancel` messages on the request stream to stop an in-flight
+  // transcription cooperatively (§2.5.1).
+  rpc Transcribe(stream SttRequest) returns (stream SttResponse);
+}
+
+// One message on the client-to-server request stream.
+message SttRequest {
+  oneof payload {
+    // A chunk of input audio to transcribe.
+    marceline.common.AudioChunk audio = 1;
+    // Cooperative cancel signal; worker returns early between decode steps.
+    marceline.common.Cancel cancel = 2;
+  }
+}
+
+// One message on the server-to-client response stream.
+message SttResponse {
+  oneof transcript {
+    // Revisable, non-final text (e.g. "helo" -> "hello"). Only emitted by
+    // backends that advertise partials support; never sent to the LLM.
+    string partial = 1;
+    // Committed transcript; the only variant that reaches the LLM.
+    FinalTranscript final = 2;
+  }
+}
+
+// A committed (final) transcript segment.
+message FinalTranscript {
+  // Final recognized text.
+  string text = 1;
+  // Backend-reported confidence in [0, 1].
+  float confidence = 2;
+}

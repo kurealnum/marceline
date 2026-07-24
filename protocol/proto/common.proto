@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+// Types shared by the Stt and Tts streaming contracts (SPEC.md §2.4.1).
+package marceline.common;
+
+// Self-describing PCM audio chunk. Sample rate and channel count travel
+// with every chunk (invariant 2, §2.4.1) so no consumer branches on, or
+// assumes, an out-of-band format. `seq` lets a consumer detect
+// dropped/reordered chunks (shared by mic-in and TTS-out).
+message AudioChunk {
+  // Monotonic sequence number within the stream.
+  uint64 seq = 1;
+  // Interleaved f32 PCM samples.
+  repeated float pcm = 2;
+  // Sample rate in Hz.
+  uint32 sample_rate = 3;
+  // Channel count.
+  uint32 channels = 4;
+}
+
+// Explicit cooperative-cancel signal (SPEC.md §2.5.1), sent in-band on a
+// streaming request. Socket close is not a reliable stop signal mid-GPU-op,
+// so the worker's generate loop checks for this message between decode
+// steps and returns early instead.
+message Cancel {}

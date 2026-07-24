@@ -1,0 +1,3 @@
+# Runtime deps for consumers of the generated stubs (workers import this).
+grpcio==1.66.2
+protobuf>=5.26.1,<6.0dev
