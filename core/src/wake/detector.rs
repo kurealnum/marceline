@@ -13,6 +13,12 @@ pub trait WakeDetector: Send {
     /// score))` if this frame completes a fire, where `word_index` indexes
     /// into the detector's configured word list.
     fn process(&mut self, frame: &[f32]) -> Option<(usize, f32)>;
+
+    /// The detector's current per-frame score, whether or not it fired.
+    /// Lets callers log near-misses (SPEC.md EPIC 2.4: "log wake scores,
+    /// fired and near-miss, so tuning is data-driven") without waiting
+    /// for an actual fire.
+    fn current_score(&self) -> f32;
 }
 
 /// Placeholder [`WakeDetector`]: fires when a leaky RMS envelope stays
@@ -100,6 +106,10 @@ impl WakeDetector for EnergyWakeDetector {
             return Some((0, self.envelope.min(1.0)));
         }
         None
+    }
+
+    fn current_score(&self) -> f32 {
+        self.envelope.min(1.0)
     }
 }
 

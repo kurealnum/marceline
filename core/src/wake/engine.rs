@@ -30,6 +30,10 @@ impl WakeEngine {
 
     /// Feeds one capture-rate chunk through the pipeline: resample to
     /// 16kHz mono, run the detector, and log + return an event if it fired.
+    ///
+    /// Every call logs the detector's current score at debug level —
+    /// fired or not — so sensitivity tuning (EPIC 2.4) is data-driven
+    /// instead of guesswork; a fire additionally logs at info level.
     pub fn process_chunk(&mut self, chunk: &AudioChunk) -> Option<WakeEvent> {
         let frame = resample::resample(
             &chunk.pcm,
@@ -38,7 +42,14 @@ impl WakeEngine {
             WAKE_SAMPLE_RATE,
             1,
         );
-        let (word_index, score) = self.detector.process(&frame)?;
+        let fire = self.detector.process(&frame);
+        tracing::debug!(
+            score = self.detector.current_score(),
+            fired = fire.is_some(),
+            "wake score"
+        );
+
+        let (word_index, score) = fire?;
         let word = self
             .words
             .get(word_index)
@@ -52,6 +63,13 @@ impl WakeEngine {
             score,
             timestamp: std::time::SystemTime::now(),
         })
+    }
+
+    /// The detector's current per-frame score after the most recent
+    /// [`process_chunk`](Self::process_chunk) call, fired or not. Lets
+    /// tuning tools (EPIC 2.4) track near-miss scores without parsing logs.
+    pub fn last_score(&self) -> f32 {
+        self.detector.current_score()
     }
 }
 
@@ -113,6 +131,36 @@ mod tests {
             }
         }
         assert!(fired, "should still fire after internal resampling");
+    }
+
+    #[test]
+    fn sensitivity_measurably_shifts_fire_behavior() {
+        // A borderline-quiet tone: too quiet to cross the low-sensitivity
+        // threshold, loud enough to cross the high-sensitivity one.
+        let borderline = tone_chunk(320, 0.2, WAKE_SAMPLE_RATE);
+
+        let low_cfg = WakeConfig {
+            words: vec!["marceline".into()],
+            sensitivity: 0.3,
+        };
+        let mut low_engine = WakeEngine::new(
+            &low_cfg,
+            Box::new(EnergyWakeDetector::new(low_cfg.sensitivity, WAKE_SAMPLE_RATE, 320)),
+        );
+        let low_fired = (0..30).any(|_| low_engine.process_chunk(&borderline).is_some());
+
+        let high_cfg = WakeConfig {
+            words: vec!["marceline".into()],
+            sensitivity: 0.9,
+        };
+        let mut high_engine = WakeEngine::new(
+            &high_cfg,
+            Box::new(EnergyWakeDetector::new(high_cfg.sensitivity, WAKE_SAMPLE_RATE, 320)),
+        );
+        let high_fired = (0..30).any(|_| high_engine.process_chunk(&borderline).is_some());
+
+        assert!(!low_fired, "low sensitivity should not fire on a borderline-quiet tone");
+        assert!(high_fired, "high sensitivity should fire on the same tone");
     }
 
     #[test]
