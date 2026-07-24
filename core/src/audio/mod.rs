@@ -4,13 +4,17 @@
 
 pub mod capture;
 pub mod device_select;
+pub mod meter;
 pub mod playback;
 pub mod resample;
 pub mod ring;
+pub mod wav_tap;
 
 pub use capture::{Capture, CaptureError};
+pub use meter::LevelMeter;
 pub use playback::{Playback, PlaybackError};
 pub use ring::PreRollRing;
+pub use wav_tap::{WavTap, WavTapError};
 
 /// Self-describing PCM audio chunk (SPEC.md §2.4.1 invariant 2): sample
 /// rate and channel count travel with the data, so no consumer branches
