@@ -25,7 +25,7 @@ fn sine_chunk(seconds: f32, freq: f32, sample_rate: u32, channels: u16) -> Audio
 }
 
 fn main() {
-    let playback = Playback::start().expect("failed to start playback");
+    let playback = Playback::start(None).expect("failed to start playback");
     let rate = playback.sample_rate();
     let channels = playback.channels();
     println!("device sample_rate={rate} channels={channels}");

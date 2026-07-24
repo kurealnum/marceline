@@ -3,7 +3,9 @@
 //! land in later EPIC 1 stories.
 
 pub mod capture;
+pub mod device_select;
 pub mod playback;
+pub mod resample;
 pub mod ring;
 
 pub use capture::{Capture, CaptureError};
