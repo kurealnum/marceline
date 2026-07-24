@@ -6,7 +6,7 @@ pub mod device;
 pub mod logging;
 pub mod supervisor;
 
-pub use audio::{AudioChunk, Capture, CaptureError};
+pub use audio::{AudioChunk, Capture, CaptureError, Playback, PlaybackError};
 pub use config::{Config, ConfigError};
 pub use device::Device;
 pub use supervisor::{HealthView, Supervisor, WorkerSpec, WorkerState};
