@@ -13,6 +13,8 @@ use std::sync::{Arc, Mutex};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, Stream, StreamConfig};
 
+use super::device_select::resolve;
+use super::resample;
 use super::AudioChunk;
 
 /// Errors that can occur while starting playback.
@@ -50,12 +52,18 @@ pub struct Playback {
 }
 
 impl Playback {
-    /// Opens the default output device and starts the output stream.
-    pub fn start() -> Result<Self, PlaybackError> {
+    /// Opens the output device named by `output_device` (falling back to
+    /// the system default if absent/empty/unrecognized, EPIC 1.3) and
+    /// starts the output stream.
+    pub fn start(output_device: Option<&str>) -> Result<Self, PlaybackError> {
         let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .ok_or(PlaybackError::NoOutputDevice)?;
+        let devices = host
+            .output_devices()
+            .map_err(|_| PlaybackError::NoOutputDevice)?;
+        let device = resolve(devices, output_device, "output", || {
+            host.default_output_device()
+        })
+        .ok_or(PlaybackError::NoOutputDevice)?;
         let supported = device.default_output_config()?;
         let sample_rate = supported.sample_rate().0;
         let channels = supported.channels();
@@ -84,12 +92,24 @@ impl Playback {
         self.channels
     }
 
-    /// Appends `chunk`'s PCM to the playback ring. Per story 1.2's scope,
-    /// `chunk.sample_rate`/`chunk.channels` are assumed to already match
-    /// the device (resampling lands in story 1.3).
+    /// Appends `chunk`'s PCM to the playback ring, resampling from the
+    /// chunk's declared rate/channels to the device's if they differ
+    /// (EPIC 1.3) — this stage owns resampling (SPEC.md §2.4.1), driven
+    /// by each chunk's self-describing rate.
     pub fn push(&self, chunk: &AudioChunk) {
+        let pcm = if chunk.sample_rate == self.sample_rate && chunk.channels == self.channels {
+            chunk.pcm.clone()
+        } else {
+            resample::resample(
+                &chunk.pcm,
+                chunk.sample_rate,
+                chunk.channels,
+                self.sample_rate,
+                self.channels,
+            )
+        };
         let mut ring = self.ring.lock().expect("playback ring lock poisoned");
-        ring.extend(chunk.pcm.iter().copied());
+        ring.extend(pcm);
     }
 
     /// Drops all currently buffered audio immediately, so nothing already

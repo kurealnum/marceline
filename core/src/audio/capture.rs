@@ -11,6 +11,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Sample, SampleFormat, Stream, StreamConfig};
 use crossbeam_channel::{Receiver, Sender};
 
+use super::device_select::resolve;
 use super::ring::PreRollRing;
 use super::AudioChunk;
 
@@ -47,14 +48,17 @@ pub struct Capture {
 }
 
 impl Capture {
-    /// Opens the default input device and starts streaming mic frames.
-    /// `preroll_seconds` sizes the retained pre-roll window (SPEC.md §2.6
-    /// recommends ~1-2s).
-    pub fn start(preroll_seconds: f32) -> Result<Self, CaptureError> {
+    /// Opens the input device named by `input_device` (falling back to
+    /// the system default if absent/empty/unrecognized, EPIC 1.3) and
+    /// starts streaming mic frames. `preroll_seconds` sizes the retained
+    /// pre-roll window (SPEC.md §2.6 recommends ~1-2s).
+    pub fn start(preroll_seconds: f32, input_device: Option<&str>) -> Result<Self, CaptureError> {
         let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .ok_or(CaptureError::NoInputDevice)?;
+        let devices = host.input_devices().map_err(|_| CaptureError::NoInputDevice)?;
+        let device = resolve(devices, input_device, "input", || {
+            host.default_input_device()
+        })
+        .ok_or(CaptureError::NoInputDevice)?;
         let supported = device.default_input_config()?;
         let sample_rate = supported.sample_rate().0;
         let channels = supported.channels();

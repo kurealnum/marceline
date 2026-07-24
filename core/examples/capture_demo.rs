@@ -3,7 +3,7 @@
 use std::time::{Duration, Instant};
 
 fn main() {
-    let capture = marceline_core::Capture::start(1.5).expect("failed to start capture");
+    let capture = marceline_core::Capture::start(1.5, None).expect("failed to start capture");
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut chunks = 0u64;
     let mut samples = 0u64;

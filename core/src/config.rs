@@ -150,6 +150,25 @@ pub struct EgressConfig {
     pub log: bool,
 }
 
+/// Audio input/output device selection (`[audio]`, EPIC 1.3).
+///
+/// Absent from older config files entirely (the whole section defaults
+/// via `#[serde(default)]` on [`Config::audio`]) and both fields default
+/// to `None`, meaning "use the system default device."
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AudioConfig {
+    /// Input device name to capture from. `None`/absent/empty resolves to
+    /// the host's default input device; an unrecognized name falls back
+    /// to the default with a warning (resolution happens in
+    /// `core::audio`, not here — this struct only carries the request).
+    #[serde(default)]
+    pub input_device: Option<String>,
+    /// Output device name to play to. Same fallback behavior as
+    /// `input_device`.
+    #[serde(default)]
+    pub output_device: Option<String>,
+}
+
 /// Top-level, versioned machine/runtime configuration (`config.toml`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -169,6 +188,10 @@ pub struct Config {
     pub memory: MemoryConfig,
     /// Egress auditing settings.
     pub egress: EgressConfig,
+    /// Audio input/output device selection. Defaults when the whole
+    /// `[audio]` section is absent, so older config files keep loading.
+    #[serde(default)]
+    pub audio: AudioConfig,
 }
 
 impl Config {
