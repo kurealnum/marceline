@@ -8,3 +8,5 @@ name = "marceline"
 path = "src/main.rs"
 
 [dependencies]
+core = { path = "../core" }
+tracing = "0.1"
