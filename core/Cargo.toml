@@ -20,3 +20,4 @@ tower = "0.4"
 hyper-util = { version = "0.1", features = ["tokio"] }
 cpal = "0.15"
 crossbeam-channel = "0.5"
+hound = "3"
