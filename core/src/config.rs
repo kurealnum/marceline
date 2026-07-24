@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::device::Device;
+
 /// Current config schema version. Bump when adding a migration step.
 pub const CURRENT_VERSION: u32 = 1;
 
@@ -58,7 +60,7 @@ pub struct SttConfig {
     /// Model identifier/name.
     pub model: String,
     /// Compute device. v1: cuda only (device seam is story 0.7).
-    pub device: String,
+    pub device: Device,
     /// Recognition language. v1 is English-only.
     pub lang: String,
 }
@@ -98,7 +100,7 @@ pub struct TtsConfig {
     /// Backend-specific voice id.
     pub voice: String,
     /// Compute device.
-    pub device: String,
+    pub device: Device,
 }
 
 /// Wake word configuration (`[wake]`).
@@ -131,7 +133,7 @@ pub struct MemoryConfig {
     /// Embedding model identifier.
     pub embed_model: String,
     /// Compute device used for embedding.
-    pub embed_device: String,
+    pub embed_device: Device,
 }
 
 impl MemoryConfig {
@@ -403,6 +405,16 @@ log = true
         let path = scratch_path("invalid.toml");
         fs::write(&path, "version = 1\n[stt]\nbackend = \"whisper\"\n").unwrap();
         let err = Config::load(&path).expect_err("missing required fields should fail");
+        assert!(matches!(err, ConfigError::Parse { .. }));
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn rejects_unsupported_device_with_clear_error() {
+        let path = scratch_path("bad-device.toml");
+        let bad = VALID_V1.replacen("device = \"cuda\"", "device = \"metal\"", 1);
+        fs::write(&path, bad).unwrap();
+        let err = Config::load(&path).expect_err("unsupported device should fail");
         assert!(matches!(err, ConfigError::Parse { .. }));
         fs::remove_file(&path).ok();
     }
