@@ -8,23 +8,23 @@
 //! holds, so a same-breath command isn't lost to the ~300ms IDLE ->
 //! LISTENING flip.
 //!
-//! Endpointing thresholds here are placeholder constants matching the
-//! `[vad]` config defaults established in EPIC 0 — reading them from
-//! config and tuning them on real speech is EPIC 2.5's job, not this
-//! story's.
+//! Endpointing thresholds (`silence_ms`, `min_utterance_ms`,
+//! `max_utterance_ms`) are read from `[vad]` config (EPIC 2.5) rather
+//! than hardcoded: `silence_ms` ends the utterance once speech has been
+//! heard; `min_utterance_ms` discards blips too short to be real speech;
+//! `max_utterance_ms` force-emits a stuck/over-long segment rather than
+//! collecting forever.
 
 use crate::audio::resample;
+use crate::config::VadConfig;
 use crate::vad::FRAME_SAMPLES;
 use crate::wake::WakeEngine;
 use crate::{AudioChunk, VadEndpointer};
 
-/// Silence duration that ends an utterance once speech has been heard.
-/// Matches the `[vad].silence_ms` default from EPIC 0's config.
-const SILENCE_END_MS: u64 = 700;
-
 /// How long LISTENING waits for speech to begin (after wake fires) before
-/// giving up and returning to IDLE. Concrete timeout values are a tuning
-/// knob (SPEC.md EPIC 8.3); this is a reasonable placeholder.
+/// giving up and returning to IDLE. Not one of the three `[vad]` knobs
+/// this story wires; concrete timeout values are a tuning knob (SPEC.md
+/// EPIC 8.3) and this is a reasonable placeholder.
 const NO_SPEECH_TIMEOUT_MS: u64 = 3_000;
 
 /// Which state the gate is in.
@@ -49,6 +49,10 @@ pub enum GateOutput {
     /// An utterance was collected end-to-end; the gate emitted it as one
     /// segment (pre-roll audio at its head) and returned to IDLE.
     Segment(AudioChunk),
+    /// Speech was heard but the whole utterance (speech onset to
+    /// silence-triggered end) was shorter than `min_utterance_ms` — too
+    /// short to be real speech. Discarded; the gate returned to IDLE.
+    TooShort,
 }
 
 /// The gate state machine: wake detection plus VAD-driven utterance
@@ -57,6 +61,11 @@ pub struct Gate {
     state: GateState,
     wake: WakeEngine,
     vad: VadEndpointer,
+    /// `silence_ms`/`min_utterance_ms`/`max_utterance_ms`, as `u64` for
+    /// comparison against the millisecond counters below.
+    silence_end_ms: u64,
+    min_utterance_ms: u64,
+    max_utterance_ms: u64,
     /// Chunks collected for the utterance in progress, at capture's
     /// native sample_rate/channels (not resampled) so the emitted segment
     /// is full quality for STT.
@@ -70,19 +79,32 @@ pub struct Gate {
     speech_seen: bool,
     /// Milliseconds elapsed in LISTENING with no speech yet.
     no_speech_elapsed_ms: u64,
+    /// Total milliseconds elapsed since LISTENING began (wake fire),
+    /// including any pre-roll-seeded head — used for `max_utterance_ms`.
+    total_listening_ms: u64,
+    /// `total_listening_ms` at the moment speech first began this
+    /// utterance — used to compute the speech-onset-to-end span checked
+    /// against `min_utterance_ms`.
+    speech_onset_ms: Option<u64>,
 }
 
 impl Gate {
-    /// Builds a gate from a wake engine and a VAD endpointer.
-    pub fn new(wake: WakeEngine, vad: VadEndpointer) -> Self {
+    /// Builds a gate from a wake engine, a VAD endpointer, and the
+    /// `[vad]` endpointing thresholds (EPIC 2.5).
+    pub fn new(wake: WakeEngine, vad: VadEndpointer, vad_config: &VadConfig) -> Self {
         Self {
             state: GateState::Idle,
             wake,
             vad,
+            silence_end_ms: vad_config.silence_ms as u64,
+            min_utterance_ms: vad_config.min_utterance_ms as u64,
+            max_utterance_ms: vad_config.max_utterance_ms as u64,
             utterance: Vec::new(),
             vad_pending: Vec::new(),
             speech_seen: false,
             no_speech_elapsed_ms: 0,
+            total_listening_ms: 0,
+            speech_onset_ms: None,
         }
     }
 
@@ -110,6 +132,8 @@ impl Gate {
         self.vad_pending.clear();
         self.speech_seen = false;
         self.no_speech_elapsed_ms = 0;
+        self.total_listening_ms = 0;
+        self.speech_onset_ms = None;
         self.utterance.clear();
         if !preroll.pcm.is_empty() {
             self.utterance.push(preroll.clone());
@@ -145,9 +169,15 @@ impl Gate {
             }
         }
 
+        let speech_just_began = any_speech_this_chunk && !self.speech_seen;
         if any_speech_this_chunk {
             self.speech_seen = true;
         }
+        if speech_just_began {
+            self.speech_onset_ms = Some(self.total_listening_ms);
+        }
+
+        self.total_listening_ms += chunk_ms;
 
         if !self.speech_seen {
             self.no_speech_elapsed_ms += chunk_ms;
@@ -159,14 +189,38 @@ impl Gate {
             return GateOutput::None;
         }
 
-        if self.vad.silence_ms() >= SILENCE_END_MS {
-            let segment = merge_chunks(&self.utterance);
-            self.utterance.clear();
-            self.state = GateState::Idle;
-            return GateOutput::Segment(segment);
+        // Hard cap: force-emit rather than let a stuck/noisy segment run
+        // forever, regardless of the trailing-silence state.
+        if self.total_listening_ms >= self.max_utterance_ms {
+            return self.end_utterance();
+        }
+
+        if self.vad.silence_ms() >= self.silence_end_ms {
+            return self.end_utterance();
         }
 
         GateOutput::None
+    }
+
+    /// Ends the in-progress utterance: emits the collected segment unless
+    /// its speech-onset-to-end span is under `min_utterance_ms`, in which
+    /// case it's discarded as too short to be real speech. Either way,
+    /// returns the gate to IDLE.
+    fn end_utterance(&mut self) -> GateOutput {
+        let span_ms = self
+            .speech_onset_ms
+            .map(|onset| self.total_listening_ms.saturating_sub(onset))
+            .unwrap_or(0);
+
+        self.state = GateState::Idle;
+        if span_ms < self.min_utterance_ms {
+            self.utterance.clear();
+            return GateOutput::TooShort;
+        }
+
+        let segment = merge_chunks(&self.utterance);
+        self.utterance.clear();
+        GateOutput::Segment(segment)
     }
 }
 

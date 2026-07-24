@@ -8,7 +8,7 @@
 use std::env::temp_dir;
 use std::time::{Duration, Instant};
 
-use marceline_core::config::WakeConfig;
+use marceline_core::config::{VadConfig, WakeConfig};
 use marceline_core::{
     Capture, EnergyWakeDetector, Gate, GateOutput, SileroVad, VadEndpointer, WakeEngine, WavTap,
     DEFAULT_SPEECH_THRESHOLD,
@@ -28,7 +28,12 @@ fn main() {
     let vad = SileroVad::load(&model_path).expect("failed to load Silero VAD model");
     let endpointer = VadEndpointer::new(vad, DEFAULT_SPEECH_THRESHOLD);
 
-    let mut gate = Gate::new(wake, endpointer);
+    let vad_config = VadConfig {
+        silence_ms: 700,
+        min_utterance_ms: 300,
+        max_utterance_ms: 15_000,
+    };
+    let mut gate = Gate::new(wake, endpointer, &vad_config);
 
     println!("IDLE. Make a loud sound to fire wake (placeholder detector), then speak.");
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -57,6 +62,7 @@ fn main() {
                 );
                 segment_written = true;
             }
+            GateOutput::TooShort => println!("(utterance discarded: too short)"),
             GateOutput::None => {}
         }
     }
