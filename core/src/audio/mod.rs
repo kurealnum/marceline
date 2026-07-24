@@ -3,9 +3,11 @@
 //! land in later EPIC 1 stories.
 
 pub mod capture;
+pub mod playback;
 pub mod ring;
 
 pub use capture::{Capture, CaptureError};
+pub use playback::{Playback, PlaybackError};
 pub use ring::PreRollRing;
 
 /// Self-describing PCM audio chunk (SPEC.md §2.4.1 invariant 2): sample
