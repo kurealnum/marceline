@@ -156,10 +156,15 @@ forcing a rewrite. Pin them down first. Three invariants govern all four:
 1. **Every stream item is a `Result`** — errors propagate in-band, mid-stream
    (worker OOM at chunk 40, LLM 500 mid-token). Never `Stream<Item = T>`; always
    `Stream<Item = Result<T, EngineError>>`.
-2. **Every audio chunk self-describes its format** — sample rate / channels / format
-   travel with the data. No out-of-band rate assumption (that is how you get a
-   chipmunk voice when a 22050 Hz worker feeds a 48000 Hz sink). Resampling ownership
-   is explicit: the audio-out stage owns it, driven by the chunk's declared rate.
+2. **All internal audio is f32; rate + channels travel with the data.** Sample
+   *format* is fixed by the type (`pcm: Vec<f32>`), not carried — every mic/worker
+   boundary converts to f32 once on the way in, so no consumer branches on format.
+   (If zero-copy i16 passthrough is ever needed for perf, switch `pcm` to `Vec<u8>` +
+   a `format: SampleFormat` field then — deliberately deferred; f32-everywhere is
+   simpler and Whisper/Kokoro/cpal all handle it.) Sample rate / channels still travel
+   with each chunk: no out-of-band rate assumption (that is how you get a chipmunk
+   voice when a 22050 Hz worker feeds a 48000 Hz sink). Resampling ownership is
+   explicit: the audio-out stage owns it, driven by the chunk's declared rate.
 3. **LLM output is a tagged event enum, not a token string** — tool calls must be
    first-class events or the THINKING loop (§4, §6) cannot be built.
 
@@ -230,9 +235,12 @@ IDLE ──wake word──▶ LISTENING ──VAD end──▶ TRANSCRIBING ─�
   in-flight stage + flush audio out → jump to LISTENING.
 - **Error / timeout edges** (every state has one): `no-speech` timeout in LISTENING,
   empty/failed transcript in TRANSCRIBING, LLM error or tool timeout in THINKING,
+  **hallucinated transcript on near-silence** in TRANSCRIBING (see below),
   worker-down in TRANSCRIBING/SPEAKING. All route through **ERROR**, which speaks a
-  graceful message (§9.11) and returns to IDLE — never a silent hang. Concrete
-  timeout values are a tuning knob (EPIC 8.3).
+  graceful message (§9.11) and returns to IDLE — never a silent *hang*. Exception: if
+  the failed stage **is TTS itself**, no spoken message is possible; ERROR logs and
+  returns to IDLE silently (accepted — §9.11). Concrete timeout values are a tuning knob
+  (EPIC 8.3).
 - **Wake word while already SPEAKING/THINKING** is treated as barge-in, not a new
   session (§9.13). A second wake word mid-LISTENING re-arms the utterance.
 
@@ -313,6 +321,11 @@ speech before firing (§EPIC 7.4) so a cough does not waste a turn.
 ### 2.6 Audio pipeline details
 
 - Capture + playback via `cpal` (cross-platform). Ring buffer between capture and gate.
+- **Pre-roll buffer (same-breath capture).** The capture ring retains the last ~1–2s of
+  mic frames at all times. When the wake word fires, utterance capture is **seeded from
+  the pre-roll**, not started empty — otherwise a same-breath command
+  ("Marceline stop that's wrong") loses the words spoken during the ~300ms state flip to
+  LISTENING. Applies to wake-from-IDLE and to barge-in (§2.5.1) alike.
 - **Wake word:** `openWakeWord` (permissive license; models produced in EPIC 13). Runs
   cheaply on every frame — used both to open the mic from IDLE and as the barge-in
   intent gate during SPEAKING (§2.5.1). (Porcupine considered and dropped — commercial
@@ -352,6 +365,11 @@ model    = "local-model"
 api_key_env = "MARCELINE_LLM_KEY"       # secret lives in env, never in this file
 max_tokens_per_turn    = 2048           # cost guardrail (EPIC 4.5)
 max_requests_per_session = 200          # cost guardrail (EPIC 4.5)
+max_tool_iterations_per_turn = 8        # TEMP: caps the THINKING tool-call loop (EPIC 6.3)
+                                        # so the LLM can't spin tool calls forever. v1 reads the
+                                        # override from env MARCELINE_MAX_TOOL_ITERS; promote to a
+                                        # first-class tuned knob later. On breach: stop the loop,
+                                        # feed a "tool budget exhausted" note back, force a final answer.
 
 [tts]
 backend = "kokoro"              # kokoro | piper
@@ -452,6 +470,37 @@ Three layers, increasing scope:
 > Design note: keep memory _auditable and editable_ — plain rows the user can inspect
 > and delete. Privacy is a feature for a local assistant.
 
+### 5.1 Untrusted-content provenance (persists through memory)
+
+Prompt-injection defense (EPIC 14.1) treats tool-returned content (web pages, MCP
+results) as untrusted. That taint **must survive into long-term memory**, or the
+summarizer (§9.15 / 10.4) launders untrusted web/MCP text into a memory entry that is
+later injected into the system prompt as *trusted* — a persistent, cross-session
+injection vector.
+
+- Every memory row (and every conversation turn) carries a `provenance` /
+  `trust` tag: `user` | `assistant` | `tool_untrusted`.
+- The summarizer preserves the tag on derived entries: anything distilled from
+  `tool_untrusted` source stays `tool_untrusted`.
+- At prompt-compile time, `tool_untrusted` memories are injected inside a clearly
+  fenced, non-authoritative block — never as instructions, never able to escalate
+  tool permissions or trigger side-effecting tools (same rule as EPIC 14.1).
+
+### 5.2 Embedding-model swaps must re-embed
+
+Vectors are only comparable within the space of the model that produced them.
+Changing `[memory].embed_model` changes dimensionality / geometry, so old vectors
+become garbage against new query embeddings — silently (no error, just nonsense
+retrieval).
+
+- **Store the source text of every embedded entry**, plus the `embed_model` id and
+  vector dimension used, alongside the vector.
+- On startup, if the configured `embed_model` differs from the stored one, run a
+  **re-embed migration**: recompute all vectors from the saved source text with the
+  new model, then swap. Never mix vectors from two models in one index.
+- CLI surfaces this (`marceline memory reembed`) so a swap is explicit, not silent
+  corruption. (EPIC 10.3.)
+
 ---
 
 ## 6. Tech stack summary
@@ -545,6 +594,12 @@ Goal: audio segment → text, hot-swappable model.
 - **3.4** Model hot-swap: change model via config/CLI, worker restarts. _(depends 3.1)_
 - **3.5** Support `faster-whisper` as a second backend (vs. the HF `whisper` default)
   to prove pluggability via a config line. _(depends 3.1)_
+- **3.6** Silence/hallucination guard. Whisper invents plausible text on near-silence
+  or non-speech (famous failure mode) — VAD endpointing reduces but does not eliminate
+  it. Gate the transcript before it reaches the LLM: drop segments below a min speech
+  duration, use the backend's no-speech / avg-logprob signals where available, and route
+  a rejected transcript through the empty-transcript ERROR edge (§2.5) rather than
+  speaking a hallucination back. _(depends 3.3)_
 - **Demoable:** `marceline transcribe sample.wav` prints the transcript; swap model
   in config, rerun, still works.
 
