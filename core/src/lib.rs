@@ -5,6 +5,7 @@ pub mod config;
 pub mod device;
 pub mod logging;
 pub mod supervisor;
+pub mod vad;
 pub mod wake;
 
 pub use audio::{
@@ -13,4 +14,5 @@ pub use audio::{
 pub use config::{Config, ConfigError};
 pub use device::Device;
 pub use supervisor::{HealthView, Supervisor, WorkerSpec, WorkerState};
+pub use vad::{SileroVad, VadEndpointer, VadError, DEFAULT_SPEECH_THRESHOLD, FRAME_SAMPLES};
 pub use wake::{EnergyWakeDetector, WakeDetector, WakeEngine, WakeEvent};
