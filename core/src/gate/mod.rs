@@ -1,0 +1,241 @@
+//! The wake+VAD gate state machine (SPEC.md §2.1, §2.5, §2.6, EPIC 2.3):
+//! `IDLE -> LISTENING -> (collect utterance) -> emit audio segment`. Turns
+//! always-on mic frames into clean, bounded audio segments the
+//! orchestrator (EPIC 8) and STT (EPIC 3) consume directly.
+//!
+//! Utterance capture is seeded from the capture pre-roll ring (§2.6): the
+//! wake-firing chunk is prepended with whatever the pre-roll already
+//! holds, so a same-breath command isn't lost to the ~300ms IDLE ->
+//! LISTENING flip.
+//!
+//! Endpointing thresholds (`silence_ms`, `min_utterance_ms`,
+//! `max_utterance_ms`) are read from `[vad]` config (EPIC 2.5) rather
+//! than hardcoded: `silence_ms` ends the utterance once speech has been
+//! heard; `min_utterance_ms` discards blips too short to be real speech;
+//! `max_utterance_ms` force-emits a stuck/over-long segment rather than
+//! collecting forever.
+
+use crate::audio::resample;
+use crate::config::VadConfig;
+use crate::vad::FRAME_SAMPLES;
+use crate::wake::WakeEngine;
+use crate::{AudioChunk, VadEndpointer};
+
+/// How long LISTENING waits for speech to begin (after wake fires) before
+/// giving up and returning to IDLE. Not one of the three `[vad]` knobs
+/// this story wires; concrete timeout values are a tuning knob (SPEC.md
+/// EPIC 8.3) and this is a reasonable placeholder.
+const NO_SPEECH_TIMEOUT_MS: u64 = 3_000;
+
+/// Which state the gate is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateState {
+    /// Not listening; running the wake detector on every frame.
+    Idle,
+    /// Collecting an utterance following a wake event.
+    Listening,
+}
+
+/// What happened as a result of feeding one chunk to the gate.
+#[derive(Debug)]
+pub enum GateOutput {
+    /// Nothing notable this chunk.
+    None,
+    /// A wake word just fired; the gate transitioned IDLE -> LISTENING.
+    Wake,
+    /// Wake fired but no speech followed within the no-speech timeout;
+    /// the gate discarded the utterance and returned to IDLE.
+    NoSpeechTimeout,
+    /// An utterance was collected end-to-end; the gate emitted it as one
+    /// segment (pre-roll audio at its head) and returned to IDLE.
+    Segment(AudioChunk),
+    /// Speech was heard but the whole utterance (speech onset to
+    /// silence-triggered end) was shorter than `min_utterance_ms` — too
+    /// short to be real speech. Discarded; the gate returned to IDLE.
+    TooShort,
+}
+
+/// The gate state machine: wake detection plus VAD-driven utterance
+/// collection.
+pub struct Gate {
+    state: GateState,
+    wake: WakeEngine,
+    vad: VadEndpointer,
+    /// `silence_ms`/`min_utterance_ms`/`max_utterance_ms`, as `u64` for
+    /// comparison against the millisecond counters below.
+    silence_end_ms: u64,
+    min_utterance_ms: u64,
+    max_utterance_ms: u64,
+    /// Chunks collected for the utterance in progress, at capture's
+    /// native sample_rate/channels (not resampled) so the emitted segment
+    /// is full quality for STT.
+    utterance: Vec<AudioChunk>,
+    /// 16kHz mono samples accumulated but not yet long enough for a full
+    /// VAD frame.
+    vad_pending: Vec<f32>,
+    /// Whether any speech has been detected yet in the utterance in
+    /// progress — distinguishes "never spoke, timed out" from "spoke,
+    /// then went silent."
+    speech_seen: bool,
+    /// Milliseconds elapsed in LISTENING with no speech yet.
+    no_speech_elapsed_ms: u64,
+    /// Total milliseconds elapsed since LISTENING began (wake fire),
+    /// including any pre-roll-seeded head — used for `max_utterance_ms`.
+    total_listening_ms: u64,
+    /// `total_listening_ms` at the moment speech first began this
+    /// utterance — used to compute the speech-onset-to-end span checked
+    /// against `min_utterance_ms`.
+    speech_onset_ms: Option<u64>,
+}
+
+impl Gate {
+    /// Builds a gate from a wake engine, a VAD endpointer, and the
+    /// `[vad]` endpointing thresholds (EPIC 2.5).
+    pub fn new(wake: WakeEngine, vad: VadEndpointer, vad_config: &VadConfig) -> Self {
+        Self {
+            state: GateState::Idle,
+            wake,
+            vad,
+            silence_end_ms: vad_config.silence_ms as u64,
+            min_utterance_ms: vad_config.min_utterance_ms as u64,
+            max_utterance_ms: vad_config.max_utterance_ms as u64,
+            utterance: Vec::new(),
+            vad_pending: Vec::new(),
+            speech_seen: false,
+            no_speech_elapsed_ms: 0,
+            total_listening_ms: 0,
+            speech_onset_ms: None,
+        }
+    }
+
+    /// Current state.
+    pub fn state(&self) -> GateState {
+        self.state
+    }
+
+    /// Feeds one capture-rate chunk through the gate. `preroll` is the
+    /// capture's current pre-roll snapshot (SPEC.md §2.6) — only consulted
+    /// when a wake event fires this call, to seed the utterance buffer.
+    pub fn process_chunk(&mut self, chunk: &AudioChunk, preroll: &AudioChunk) -> GateOutput {
+        match self.state {
+            GateState::Idle => self.process_idle(chunk, preroll),
+            GateState::Listening => self.process_listening(chunk),
+        }
+    }
+
+    fn process_idle(&mut self, chunk: &AudioChunk, preroll: &AudioChunk) -> GateOutput {
+        if self.wake.process_chunk(chunk).is_none() {
+            return GateOutput::None;
+        }
+
+        self.vad.reset();
+        self.vad_pending.clear();
+        self.speech_seen = false;
+        self.no_speech_elapsed_ms = 0;
+        self.total_listening_ms = 0;
+        self.speech_onset_ms = None;
+        self.utterance.clear();
+        if !preroll.pcm.is_empty() {
+            self.utterance.push(preroll.clone());
+        }
+        self.utterance.push(chunk.clone());
+        self.state = GateState::Listening;
+        GateOutput::Wake
+    }
+
+    fn process_listening(&mut self, chunk: &AudioChunk) -> GateOutput {
+        self.utterance.push(chunk.clone());
+
+        let chunk_ms = if chunk.sample_rate == 0 || chunk.channels == 0 {
+            0
+        } else {
+            (chunk.pcm.len() as u64 * 1000)
+                / (chunk.sample_rate as u64 * chunk.channels as u64)
+        };
+
+        self.vad_pending.extend(resample::resample(
+            &chunk.pcm,
+            chunk.sample_rate,
+            chunk.channels,
+            crate::vad::model::SAMPLE_RATE as u32,
+            1,
+        ));
+
+        let mut any_speech_this_chunk = false;
+        while self.vad_pending.len() >= FRAME_SAMPLES {
+            let frame: Vec<f32> = self.vad_pending.drain(..FRAME_SAMPLES).collect();
+            if self.vad.process_frame(&frame).is_ok() && self.vad.is_speaking() {
+                any_speech_this_chunk = true;
+            }
+        }
+
+        let speech_just_began = any_speech_this_chunk && !self.speech_seen;
+        if any_speech_this_chunk {
+            self.speech_seen = true;
+        }
+        if speech_just_began {
+            self.speech_onset_ms = Some(self.total_listening_ms);
+        }
+
+        self.total_listening_ms += chunk_ms;
+
+        if !self.speech_seen {
+            self.no_speech_elapsed_ms += chunk_ms;
+            if self.no_speech_elapsed_ms >= NO_SPEECH_TIMEOUT_MS {
+                self.state = GateState::Idle;
+                self.utterance.clear();
+                return GateOutput::NoSpeechTimeout;
+            }
+            return GateOutput::None;
+        }
+
+        // Hard cap: force-emit rather than let a stuck/noisy segment run
+        // forever, regardless of the trailing-silence state.
+        if self.total_listening_ms >= self.max_utterance_ms {
+            return self.end_utterance();
+        }
+
+        if self.vad.silence_ms() >= self.silence_end_ms {
+            return self.end_utterance();
+        }
+
+        GateOutput::None
+    }
+
+    /// Ends the in-progress utterance: emits the collected segment unless
+    /// its speech-onset-to-end span is under `min_utterance_ms`, in which
+    /// case it's discarded as too short to be real speech. Either way,
+    /// returns the gate to IDLE.
+    fn end_utterance(&mut self) -> GateOutput {
+        let span_ms = self
+            .speech_onset_ms
+            .map(|onset| self.total_listening_ms.saturating_sub(onset))
+            .unwrap_or(0);
+
+        self.state = GateState::Idle;
+        if span_ms < self.min_utterance_ms {
+            self.utterance.clear();
+            return GateOutput::TooShort;
+        }
+
+        let segment = merge_chunks(&self.utterance);
+        self.utterance.clear();
+        GateOutput::Segment(segment)
+    }
+}
+
+/// Concatenates same-format chunks into one, preserving the first
+/// chunk's `seq`/`sample_rate`/`channels`.
+fn merge_chunks(chunks: &[AudioChunk]) -> AudioChunk {
+    let (sample_rate, channels) = chunks
+        .first()
+        .map(|c| (c.sample_rate, c.channels))
+        .unwrap_or((0, 0));
+    let pcm = chunks.iter().flat_map(|c| c.pcm.iter().copied()).collect();
+    AudioChunk {
+        seq: chunks.first().map(|c| c.seq).unwrap_or(0),
+        pcm,
+        sample_rate,
+        channels,
+    }
+}
