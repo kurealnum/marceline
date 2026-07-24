@@ -5,6 +5,7 @@ pub mod config;
 pub mod device;
 pub mod logging;
 pub mod supervisor;
+pub mod wake;
 
 pub use audio::{
     AudioChunk, Capture, CaptureError, LevelMeter, Playback, PlaybackError, WavTap, WavTapError,
@@ -12,3 +13,4 @@ pub use audio::{
 pub use config::{Config, ConfigError};
 pub use device::Device;
 pub use supervisor::{HealthView, Supervisor, WorkerSpec, WorkerState};
+pub use wake::{EnergyWakeDetector, WakeDetector, WakeEngine, WakeEvent};
