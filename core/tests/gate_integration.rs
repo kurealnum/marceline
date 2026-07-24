@@ -3,7 +3,7 @@
 //! placeholder [`EnergyWakeDetector`] through a full wake -> listen ->
 //! speech -> silence -> emit cycle, and the no-speech-timeout bailout.
 
-use marceline_core::config::WakeConfig;
+use marceline_core::config::{VadConfig, WakeConfig};
 use marceline_core::{
     AudioChunk, EnergyWakeDetector, Gate, GateOutput, GateState, SileroVad, VadEndpointer,
     WakeEngine, DEFAULT_SPEECH_THRESHOLD,
@@ -15,7 +15,19 @@ fn model_path() -> String {
     format!("{}/../models/silero_vad.onnx", env!("CARGO_MANIFEST_DIR"))
 }
 
+fn default_vad_config() -> VadConfig {
+    VadConfig {
+        silence_ms: 700,
+        min_utterance_ms: 300,
+        max_utterance_ms: 15_000,
+    }
+}
+
 fn build_gate() -> Gate {
+    build_gate_with(&default_vad_config())
+}
+
+fn build_gate_with(vad_config: &VadConfig) -> Gate {
     let wake_config = WakeConfig {
         words: vec!["marceline".to_string()],
         sensitivity: 0.6,
@@ -24,7 +36,7 @@ fn build_gate() -> Gate {
     let wake = WakeEngine::new(&wake_config, Box::new(detector));
     let vad = SileroVad::load(model_path()).expect("failed to load Silero VAD model");
     let endpointer = VadEndpointer::new(vad, DEFAULT_SPEECH_THRESHOLD);
-    Gate::new(wake, endpointer)
+    Gate::new(wake, endpointer, vad_config)
 }
 
 fn chunk(pcm: Vec<f32>) -> AudioChunk {
@@ -99,6 +111,7 @@ fn wake_then_speech_then_silence_emits_one_segment_seeded_with_preroll() {
             GateOutput::None => {}
             GateOutput::Segment(_) => segments_during_speech += 1,
             GateOutput::NoSpeechTimeout => panic!("should not time out mid-speech"),
+            GateOutput::TooShort => panic!("continuous phrase should not be discarded as too short"),
             GateOutput::Wake => panic!("should not re-fire wake while listening"),
         }
     }
@@ -156,10 +169,103 @@ fn wake_with_no_following_speech_times_out_back_to_idle() {
                 break;
             }
             GateOutput::Segment(_) => panic!("silence alone must never emit a segment"),
+            GateOutput::TooShort => panic!("no speech was ever heard; TooShort shouldn't fire"),
             GateOutput::None => {}
             GateOutput::Wake => panic!("should not re-fire wake while listening"),
         }
     }
     assert!(timed_out, "expected a no-speech timeout");
+    assert_eq!(gate.state(), GateState::Idle);
+}
+
+#[test]
+fn min_utterance_ms_discards_a_short_speech_blip() {
+    // A tight min_utterance_ms (500ms) and a brief loud "speech" blip
+    // (well under it) followed by silence should discard, not emit.
+    let vad_config = VadConfig {
+        silence_ms: 200,
+        min_utterance_ms: 500,
+        max_utterance_ms: 15_000,
+    };
+    let mut gate = build_gate_with(&vad_config);
+    let empty_preroll = silence_chunk(0);
+
+    let mut fired = false;
+    for _ in 0..20 {
+        if matches!(
+            gate.process_chunk(&loud_tone_chunk(320), &empty_preroll),
+            GateOutput::Wake
+        ) {
+            fired = true;
+            break;
+        }
+    }
+    assert!(fired);
+
+    // ~100ms of real speech — under the 500ms min_utterance_ms floor.
+    let speech = load_speech_sample();
+    let brief_blip = &speech[..1_600.min(speech.len())];
+    for frame in brief_blip.chunks(1600) {
+        let out = gate.process_chunk(&chunk(frame.to_vec()), &empty_preroll);
+        assert!(
+            !matches!(out, GateOutput::Segment(_)),
+            "must not emit mid-blip"
+        );
+    }
+
+    let mut discarded = false;
+    for _ in 0..50 {
+        match gate.process_chunk(&silence_chunk(1600), &empty_preroll) {
+            GateOutput::TooShort => {
+                discarded = true;
+                break;
+            }
+            GateOutput::Segment(_) => panic!("a sub-min_utterance_ms blip must not emit"),
+            GateOutput::None => {}
+            other => panic!("unexpected output: {other:?}"),
+        }
+    }
+    assert!(discarded, "expected the brief blip to be discarded as too short");
+    assert_eq!(gate.state(), GateState::Idle);
+}
+
+#[test]
+fn max_utterance_ms_force_emits_an_overlong_segment() {
+    // A tiny max_utterance_ms so continuous real speech (no trailing
+    // silence at all) still gets force-emitted rather than collected
+    // forever.
+    let vad_config = VadConfig {
+        silence_ms: 700,
+        min_utterance_ms: 0,
+        max_utterance_ms: 400,
+    };
+    let mut gate = build_gate_with(&vad_config);
+    let empty_preroll = silence_chunk(0);
+
+    let mut fired = false;
+    for _ in 0..20 {
+        if matches!(
+            gate.process_chunk(&loud_tone_chunk(320), &empty_preroll),
+            GateOutput::Wake
+        ) {
+            fired = true;
+            break;
+        }
+    }
+    assert!(fired);
+
+    let speech = load_speech_sample();
+    let mut emitted = false;
+    for frame in speech.chunks(1600) {
+        match gate.process_chunk(&chunk(frame.to_vec()), &empty_preroll) {
+            GateOutput::Segment(_) => {
+                emitted = true;
+                break;
+            }
+            GateOutput::TooShort => panic!("should force-emit, not discard"),
+            _ => {}
+        }
+    }
+    assert!(emitted, "expected max_utterance_ms to force an emission");
     assert_eq!(gate.state(), GateState::Idle);
 }
