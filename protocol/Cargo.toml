@@ -8,3 +8,8 @@ name = "marceline_protocol"
 path = "src/lib.rs"
 
 [dependencies]
+prost = "0.13"
+tonic = "0.12"
+
+[build-dependencies]
+tonic-build = "0.12"
