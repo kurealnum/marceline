@@ -9,11 +9,13 @@ pub mod ipc;
 pub mod logging;
 pub mod stt;
 pub mod supervisor;
+pub mod transcribe;
 pub mod vad;
 pub mod wake;
 
 pub use audio::{
-    AudioChunk, Capture, CaptureError, LevelMeter, Playback, PlaybackError, WavTap, WavTapError,
+    read_wav, AudioChunk, Capture, CaptureError, LevelMeter, Playback, PlaybackError, WavReadError,
+    WavTap, WavTapError,
 };
 pub use config::{Config, ConfigError};
 pub use device::Device;
@@ -21,5 +23,6 @@ pub use engine::{AudioStream, EngineError};
 pub use gate::{Gate, GateOutput, GateState};
 pub use stt::{GrpcSttEngine, SttEngine, SttInfo, Transcript, TranscriptStream};
 pub use supervisor::{HealthView, Supervisor, WorkerSpec, WorkerState};
+pub use transcribe::{transcribe_segment, Transcription};
 pub use vad::{SileroVad, VadEndpointer, VadError, DEFAULT_SPEECH_THRESHOLD, FRAME_SAMPLES};
 pub use wake::{EnergyWakeDetector, WakeDetector, WakeEngine, WakeEvent};

@@ -11,3 +11,5 @@ path = "src/main.rs"
 core = { path = "../core" }
 tracing = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync"] }
+tokio-util = "0.7"
+thiserror = "1"
