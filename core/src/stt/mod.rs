@@ -13,6 +13,7 @@
 //! **v1 ships final-only**, and consumers must not assume otherwise.
 
 pub mod grpc;
+pub mod manager;
 
 use std::pin::Pin;
 
@@ -22,6 +23,7 @@ use futures::Stream;
 use crate::engine::{AudioStream, EngineError};
 
 pub use grpc::GrpcSttEngine;
+pub use manager::{SttManager, SttWorkerPaths, SwapError};
 
 /// One transcript item from an STT backend.
 ///
