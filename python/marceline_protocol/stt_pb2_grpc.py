@@ -5,7 +5,7 @@ import warnings
 
 from . import stt_pb2 as stt__pb2
 
-GRPC_GENERATED_VERSION = '1.83.0'
+GRPC_GENERATED_VERSION = '1.66.2'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -18,14 +18,14 @@ except ImportError:
 if _version_not_supported:
     raise RuntimeError(
         f'The grpc package installed is at version {GRPC_VERSION},'
-        + ' but the generated code in stt_pb2_grpc.py depends on'
+        + f' but the generated code in stt_pb2_grpc.py depends on'
         + f' grpcio>={GRPC_GENERATED_VERSION}.'
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
     )
 
 
-class SttStub:
+class SttStub(object):
     """Bidirectional-streaming STT service hosted by the Python STT worker.
     """
 
@@ -40,9 +40,14 @@ class SttStub:
                 request_serializer=stt__pb2.SttRequest.SerializeToString,
                 response_deserializer=stt__pb2.SttResponse.FromString,
                 _registered_method=True)
+        self.GetInfo = channel.unary_unary(
+                '/marceline.stt.Stt/GetInfo',
+                request_serializer=stt__pb2.SttInfoRequest.SerializeToString,
+                response_deserializer=stt__pb2.SttInfo.FromString,
+                _registered_method=True)
 
 
-class SttServicer:
+class SttServicer(object):
     """Bidirectional-streaming STT service hosted by the Python STT worker.
     """
 
@@ -50,6 +55,16 @@ class SttServicer:
         """Streams audio in, streams transcripts out. The client interleaves
         `Cancel` messages on the request stream to stop an in-flight
         transcription cooperatively (§2.5.1).
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetInfo(self, request, context):
+        """Reports the loaded backend's capabilities, so the Rust side can build
+        its `SttInfo` (§2.4) from what the worker actually loaded rather than
+        from what config asked for. Notably `partials`: v1's HF `whisper` is
+        chunk-based and final-only, and consumers must not assume otherwise.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -63,6 +78,11 @@ def add_SttServicer_to_server(servicer, server):
                     request_deserializer=stt__pb2.SttRequest.FromString,
                     response_serializer=stt__pb2.SttResponse.SerializeToString,
             ),
+            'GetInfo': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetInfo,
+                    request_deserializer=stt__pb2.SttInfoRequest.FromString,
+                    response_serializer=stt__pb2.SttInfo.SerializeToString,
+            ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
             'marceline.stt.Stt', rpc_method_handlers)
@@ -71,7 +91,7 @@ def add_SttServicer_to_server(servicer, server):
 
 
  # This class is part of an EXPERIMENTAL API.
-class Stt:
+class Stt(object):
     """Bidirectional-streaming STT service hosted by the Python STT worker.
     """
 
@@ -92,6 +112,33 @@ class Stt:
             '/marceline.stt.Stt/Transcribe',
             stt__pb2.SttRequest.SerializeToString,
             stt__pb2.SttResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetInfo(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/marceline.stt.Stt/GetInfo',
+            stt__pb2.SttInfoRequest.SerializeToString,
+            stt__pb2.SttInfo.FromString,
             options,
             channel_credentials,
             insecure,

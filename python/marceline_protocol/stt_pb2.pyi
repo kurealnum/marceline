@@ -1,10 +1,26 @@
 import common_pb2 as _common_pb2
+from google.protobuf.internal import containers as _containers
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import message as _message
-from collections.abc import Mapping as _Mapping
-from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
+from typing import ClassVar as _ClassVar, Iterable as _Iterable, Mapping as _Mapping, Optional as _Optional, Union as _Union
 
 DESCRIPTOR: _descriptor.FileDescriptor
+
+class SttInfoRequest(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class SttInfo(_message.Message):
+    __slots__ = ("name", "langs", "input_sample_rate", "partials")
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    LANGS_FIELD_NUMBER: _ClassVar[int]
+    INPUT_SAMPLE_RATE_FIELD_NUMBER: _ClassVar[int]
+    PARTIALS_FIELD_NUMBER: _ClassVar[int]
+    name: str
+    langs: _containers.RepeatedScalarFieldContainer[str]
+    input_sample_rate: int
+    partials: bool
+    def __init__(self, name: _Optional[str] = ..., langs: _Optional[_Iterable[str]] = ..., input_sample_rate: _Optional[int] = ..., partials: bool = ...) -> None: ...
 
 class SttRequest(_message.Message):
     __slots__ = ("audio", "cancel")

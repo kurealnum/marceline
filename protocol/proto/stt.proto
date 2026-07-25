@@ -12,6 +12,30 @@ service Stt {
   // `Cancel` messages on the request stream to stop an in-flight
   // transcription cooperatively (§2.5.1).
   rpc Transcribe(stream SttRequest) returns (stream SttResponse);
+  // Reports the loaded backend's capabilities, so the Rust side can build
+  // its `SttInfo` (§2.4) from what the worker actually loaded rather than
+  // from what config asked for. Notably `partials`: v1's HF `whisper` is
+  // chunk-based and final-only, and consumers must not assume otherwise.
+  rpc GetInfo(SttInfoRequest) returns (SttInfo);
+}
+
+// Empty request for `Stt.GetInfo`; a message (not `Empty`) so capability
+// filters can be added later without breaking the RPC signature.
+message SttInfoRequest {}
+
+// Capabilities of the backend this worker actually loaded.
+message SttInfo {
+  // Backend/model name, e.g. "whisper:openai/whisper-large-v3".
+  string name = 1;
+  // Language codes the loaded model is configured to recognize. v1 is
+  // English-only, so this holds exactly the configured `stt.lang`.
+  repeated string langs = 2;
+  // Sample rate (Hz) the model expects; audio at any other rate is
+  // resampled by the worker before inference.
+  uint32 input_sample_rate = 3;
+  // Whether this backend emits real, revisable `partial` transcripts.
+  // False for chunk-based Whisper: it only ever sends `final`.
+  bool partials = 4;
 }
 
 // One message on the client-to-server request stream.
