@@ -11,11 +11,10 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::sync::{watch, RwLock};
 use tokio::time::sleep;
-use tonic::transport::{Channel, Endpoint, Uri};
+use tonic::transport::Channel;
 use tonic_health::pb::health_check_response::ServingStatus;
 use tonic_health::pb::health_client::HealthClient;
 use tonic_health::pb::HealthCheckRequest;
-use tower::service_fn;
 
 use crate::device::Device;
 
@@ -214,21 +213,9 @@ impl Supervisor {
     }
 }
 
-/// Connects a `HealthClient` to a worker over its unix domain socket. The
-/// URI is a placeholder required by `tonic::transport::Endpoint`; the
-/// connector below ignores it and always dials `socket_path`.
+/// Connects a `HealthClient` to a worker over its unix domain socket.
 async fn connect_health_client(
     socket_path: &Path,
 ) -> Result<HealthClient<Channel>, tonic::transport::Error> {
-    let socket_path = socket_path.to_path_buf();
-    let channel = Endpoint::try_from("http://[::]:0")?
-        .connect_with_connector(service_fn(move |_: Uri| {
-            let socket_path = socket_path.clone();
-            async move {
-                let stream = tokio::net::UnixStream::connect(socket_path).await?;
-                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
-            }
-        }))
-        .await?;
-    Ok(HealthClient::new(channel))
+    Ok(HealthClient::new(crate::ipc::connect_uds(socket_path).await?))
 }
