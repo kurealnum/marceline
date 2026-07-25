@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Health/ping and capability client for the STT worker's UDS server.
+"""Health/ping and capability client for an STT worker's UDS server.
 
-Verifies the `Done when` criterion of EPIC 3.1 by hand — that the worker
-came up, bound its socket, and finished loading the model — and prints the
-capabilities it reports, so `partials = false` is visible without reading
-code. The Rust supervisor (EPIC 0.6) performs the same health check.
+Verifies by hand that a worker came up, bound its socket, and finished
+loading its model, and prints the capabilities it reports — so
+`partials = false` is visible without reading code. Works against any STT
+backend, since they all serve the same contract. The Rust supervisor
+(EPIC 0.6) performs the same health check.
+
+    python -m marceline_worker.health_check --socket-path /tmp/marceline-stt.sock
 """
 
 import argparse
@@ -15,7 +18,7 @@ from grpc_health.v1 import health_pb2, health_pb2_grpc
 
 from marceline_protocol import stt_pb2, stt_pb2_grpc
 
-from worker import SERVICE_NAME
+from marceline_worker.stt_service import SERVICE_NAME
 
 
 def check(socket_path: str, timeout_s: float = 5.0) -> bool:

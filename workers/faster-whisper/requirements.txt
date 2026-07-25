@@ -1,0 +1,11 @@
+# Pinned deps for the faster-whisper STT worker (EPIC 3.5).
+grpcio==1.66.2
+grpcio-health-checking==1.66.2
+protobuf>=5.26.1,<6.0dev
+
+# --- model-specific ---
+# numpy is also all the shared service's tests need; faster-whisper pulls
+# CTranslate2, which replaces torch entirely for inference — noticeably
+# lighter than the HF worker's stack.
+numpy>=1.26,<3
+faster-whisper==1.0.3
