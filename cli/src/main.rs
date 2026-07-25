@@ -11,8 +11,15 @@ use tokio::sync::{watch, RwLock};
 
 mod transcribe;
 
-/// Default socket the STT worker binds, matching `workers/stt/README.md`.
-const DEFAULT_STT_SOCKET: &str = "/tmp/marceline-stt.sock";
+/// Default config file, relative to the working directory. The full
+/// XDG-aware search path arrives with the config CLI (EPIC 11.2).
+const DEFAULT_CONFIG: &str = "config.toml";
+
+/// Config keys `marceline config set` accepts today.
+///
+/// An allowlist rather than "anything the file contains": a typo silently
+/// adding a key the daemon ignores is worse than being told no.
+const SETTABLE_KEYS: &[&str] = &["stt.model", "stt.backend"];
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
@@ -29,6 +36,7 @@ fn main() -> ExitCode {
 
     match args.get(1).map(String::as_str) {
         Some("transcribe") => runtime.block_on(run_transcribe(&args)),
+        Some("config") => run_config(&args),
         Some("--help") | Some("-h") => {
             print_usage();
             ExitCode::SUCCESS
@@ -52,21 +60,28 @@ fn print_usage() {
     eprintln!(
         "\
 Usage:
-  marceline                          Run the daemon
-  marceline transcribe <file.wav>    Transcribe a wav file and print the text
-  marceline --version                Print the version
+  marceline                            Run the daemon
+  marceline transcribe <file.wav>      Transcribe a wav file and print the text
+  marceline config get <key>           Print a config value
+  marceline config set <key> <value>   Change a config value
+  marceline --version                  Print the version
+
+Settable keys: {keys}
 
 Options:
-  --socket <path>   STT worker socket (default {DEFAULT_STT_SOCKET})
-  --verbose         Debug-level logging"
+  --config <path>   Config file (default {DEFAULT_CONFIG})
+  --socket <path>   Attach to an already-running STT worker instead of
+                    launching one from config (e.g. /tmp/marceline-stt.sock)
+  --verbose         Debug-level logging",
+        keys = SETTABLE_KEYS.join(", ")
     );
 }
 
-/// Runs `marceline transcribe <file.wav>` (EPIC 3.3, 11.4).
+/// Runs `marceline transcribe <file.wav>` (EPIC 3.3, 3.4, 11.4).
 ///
-/// Requires an already-running STT worker; launching one from `[stt]`
-/// config is story 3.4. Exits non-zero on any failure, so a wedged worker
-/// shows up as a visible error rather than as silence.
+/// Launches the STT worker described by `[stt]` config, unless `--socket`
+/// points at one already running. Exits non-zero on any failure, so a
+/// wedged worker shows up as a visible error rather than as silence.
 async fn run_transcribe(args: &[String]) -> ExitCode {
     let Some(path) = args.get(2).filter(|arg| !arg.starts_with('-')) else {
         eprintln!("transcribe requires a wav file path");
@@ -74,9 +89,16 @@ async fn run_transcribe(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    let socket = flag_value(args, "--socket").unwrap_or_else(|| DEFAULT_STT_SOCKET.to_string());
+    // `--socket` wins when given: it is the explicit "use this worker"
+    // request, and silently launching a second one would be surprising.
+    let source = match flag_value(args, "--socket") {
+        Some(socket) => transcribe::WorkerSource::Socket(PathBuf::from(socket)),
+        None => transcribe::WorkerSource::Config(PathBuf::from(
+            flag_value(args, "--config").unwrap_or_else(|| DEFAULT_CONFIG.to_string()),
+        )),
+    };
 
-    match transcribe::transcribe_file(Path::new(path), Path::new(&socket)).await {
+    match transcribe::transcribe_file(Path::new(path), source).await {
         Ok(transcription) => {
             // The transcript goes to stdout so it can be piped; everything
             // else about the run goes to stderr via tracing.
@@ -90,6 +112,78 @@ async fn run_transcribe(args: &[String]) -> ExitCode {
         }
         Err(err) => {
             eprintln!("transcription failed: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Runs `marceline config get|set` (EPIC 3.4; full config CLI is 11.2).
+///
+/// The `set` path is the CLI trigger for a model swap: it changes
+/// `[stt].model` in the file, and the next worker launch picks it up. A
+/// running daemon does not yet see the edit — that needs a control channel
+/// into the daemon, which is EPIC 11.2's job; this is called out in the
+/// output rather than left to surprise someone.
+fn run_config(args: &[String]) -> ExitCode {
+    let config_path =
+        PathBuf::from(flag_value(args, "--config").unwrap_or_else(|| DEFAULT_CONFIG.to_string()));
+
+    match args.get(2).map(String::as_str) {
+        Some("get") => {
+            let Some(key) = args.get(3) else {
+                eprintln!("config get requires a key");
+                return ExitCode::FAILURE;
+            };
+            match marceline_core::config_edit::get_string(&config_path, key) {
+                Ok(Some(value)) => {
+                    println!("{value}");
+                    ExitCode::SUCCESS
+                }
+                Ok(None) => {
+                    eprintln!("{key} is not set in {}", config_path.display());
+                    ExitCode::FAILURE
+                }
+                Err(err) => {
+                    eprintln!("config get failed: {err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Some("set") => {
+            let (Some(key), Some(value)) = (args.get(3), args.get(4)) else {
+                eprintln!("config set requires a key and a value");
+                print_usage();
+                return ExitCode::FAILURE;
+            };
+            if !SETTABLE_KEYS.contains(&key.as_str()) {
+                eprintln!(
+                    "{key} is not settable; supported keys: {}",
+                    SETTABLE_KEYS.join(", ")
+                );
+                return ExitCode::FAILURE;
+            }
+
+            match marceline_core::config_edit::set_string(&config_path, key, value) {
+                Ok(previous) => {
+                    let previous = previous.unwrap_or_else(|| "(unset)".to_string());
+                    println!("{key}: {previous} -> {value}");
+                    if key.starts_with("stt.") {
+                        eprintln!(
+                            "the stt worker will load this on its next launch; \
+                             a running daemon keeps its current model until restarted"
+                        );
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("config set failed: {err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        _ => {
+            eprintln!("config takes `get <key>` or `set <key> <value>`");
+            print_usage();
             ExitCode::FAILURE
         }
     }
@@ -132,7 +226,7 @@ async fn run(verbose: bool) {
     let health: HealthView = Arc::new(RwLock::new(HashMap::new()));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    let supervisor_task = tokio::spawn(Supervisor::new(spec, health, shutdown_rx).run());
+    let supervisor_task = tokio::spawn(Supervisor::fixed(spec, health, shutdown_rx).run());
 
     wait_for_shutdown_signal().await;
 

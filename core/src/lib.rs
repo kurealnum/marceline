@@ -2,6 +2,7 @@
 
 pub mod audio;
 pub mod config;
+pub mod config_edit;
 pub mod device;
 pub mod engine;
 pub mod gate;
@@ -18,10 +19,14 @@ pub use audio::{
     WavTap, WavTapError,
 };
 pub use config::{Config, ConfigError};
+pub use config_edit::ConfigEditError;
 pub use device::Device;
 pub use engine::{AudioStream, EngineError};
 pub use gate::{Gate, GateOutput, GateState};
-pub use stt::{GrpcSttEngine, SttEngine, SttInfo, Transcript, TranscriptStream};
+pub use stt::{
+    GrpcSttEngine, SttEngine, SttInfo, SttManager, SttWorkerPaths, SwapError, Transcript,
+    TranscriptStream,
+};
 pub use supervisor::{HealthView, Supervisor, WorkerSpec, WorkerState};
 pub use transcribe::{transcribe_segment, Transcription};
 pub use vad::{SileroVad, VadEndpointer, VadError, DEFAULT_SPEECH_THRESHOLD, FRAME_SAMPLES};

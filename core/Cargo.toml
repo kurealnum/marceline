@@ -11,6 +11,9 @@ path = "src/lib.rs"
 protocol = { path = "../protocol" }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+# Comment- and layout-preserving TOML, for writing single values back to
+# a config file a human wrote (config_edit.rs).
+toml_edit = "0.22"
 thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
