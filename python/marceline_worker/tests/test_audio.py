@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the STT worker's audio conditioning (EPIC 3.1)."""
+"""Tests for the shared worker audio conditioning (EPIC 3.1)."""
 
 from __future__ import annotations
 
@@ -9,9 +9,14 @@ import unittest
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(
+    0,
+    os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ),
+)
 
-from audio import resample, to_mono  # noqa: E402
+from marceline_worker.audio import resample, to_mono  # noqa: E402
 
 
 class ToMonoTest(unittest.TestCase):

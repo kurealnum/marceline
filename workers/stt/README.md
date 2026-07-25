@@ -5,6 +5,9 @@ subprocess hosting a Whisper-family model, serving the streaming
 `marceline.stt.Stt` contract over a unix domain socket. Built on the
 worker template (EPIC 0.4). See SPEC.md §2.2, §2.3, §2.4.1.
 
+`workers/faster-whisper/` is the alternative backend, selected by
+`[stt].backend = "faster-whisper"` (EPIC 3.5).
+
 The model runs out of process on purpose: a CUDA OOM kills a worker the
 supervisor restarts, instead of taking down the daemon (§2.2). Swapping
 models is a restart with a different `--model-id` (EPIC 3.4), not a code
@@ -14,13 +17,16 @@ change.
 
 | File | Role |
 | --- | --- |
-| `worker.py` | Entrypoint, UDS gRPC server, `Stt` servicer, cancel plumbing |
+| `worker.py` | Entrypoint; picks the backend, defers everything else to the shared service |
 | `whisper_backend.py` | HF Whisper model load + inference (imports torch/transformers) |
-| `audio.py` | Downmix + resample incoming chunks to mono 16 kHz |
-| `health_check.py` | Manual health/ping + capability dump |
-| `tests/` | `unittest` suite; stubs the model, uses a real gRPC socket |
 
-`worker.py` imports `whisper_backend` lazily, so the gRPC layer and its
+Transport, buffering, audio conditioning, cancel plumbing, and the health
+service live in `python/marceline_worker/stt_service.py`, shared with the
+`faster-whisper` worker (EPIC 3.5) so the two cannot drift apart on the
+contract. Contract-level tests live once, next to that service, and cover
+every backend.
+
+`worker.py` imports `whisper_backend` lazily, so the shared service and its
 tests need neither torch nor transformers.
 
 ## Setup
@@ -43,17 +49,22 @@ Creates `.venv` and drops a `.pth` pointing at `python/` so the generated
 `openai/whisper-large-v3`) or a full hub repo id
 (`distil-whisper/distil-large-v3`).
 
+Normally you don't run this by hand — `marceline transcribe` launches it
+from `[stt]` config (EPIC 3.4).
+
 Smoke test it from another shell — this prints the worker's capabilities
 and exits non-zero if it is not serving:
 
 ```
-.venv/bin/python health_check.py --socket-path /tmp/marceline-stt.sock
+.venv/bin/python -m marceline_worker.health_check --socket-path /tmp/marceline-stt.sock
 ```
 
 ## Tests
 
+The contract tests are shared by every STT backend:
+
 ```
-.venv/bin/python -m unittest discover -s tests
+.venv/bin/python -m unittest discover -s ../../python/marceline_worker/tests
 ```
 
 ## Streaming behavior

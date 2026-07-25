@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the STT worker's gRPC surface (EPIC 3.1).
+"""Tests for the shared STT worker gRPC surface (EPIC 3.1, 3.5).
 
 These exercise the real gRPC stack over a real unix domain socket — the
 transport is half the story of this worker, so stubbing it out would test
@@ -7,9 +7,13 @@ nothing interesting. What *is* stubbed is the model: a fake backend stands
 in for Whisper so the suite runs in milliseconds, needs no GPU, and needs
 neither torch nor transformers installed.
 
-Run from this worker's directory:
+Because this service is shared by every STT backend, these tests cover the
+contract for all of them; a backend's own tests only need to cover its
+model handling.
 
-    .venv/bin/python -m unittest discover -s tests
+Run from a worker directory that has a venv:
+
+    .venv/bin/python -m unittest discover -s ../../python/marceline_worker/tests
 """
 
 from __future__ import annotations
@@ -25,11 +29,16 @@ from dataclasses import dataclass
 import grpc
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(
+    0,
+    os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ),
+)
 
 from marceline_protocol import common_pb2, stt_pb2, stt_pb2_grpc  # noqa: E402
 
-from worker import SttServicer  # noqa: E402
+from marceline_worker.stt_service import SttServicer  # noqa: E402
 
 # Sample rate the fake backend claims to want, matching real Whisper.
 SAMPLE_RATE = 16_000
