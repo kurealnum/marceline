@@ -57,6 +57,19 @@ pub enum EngineError {
         /// What was wrong with the message.
         message: String,
     },
+    /// The backend accepted the work but produced nothing in time.
+    ///
+    /// Distinct from [`EngineError::Worker`] because a wedged worker is
+    /// indistinguishable from a slow one at the protocol level, and the
+    /// TRANSCRIBING error edge (§2.5) needs *something* to route on rather
+    /// than waiting forever.
+    #[error("{backend} backend timed out after {elapsed_ms}ms")]
+    Timeout {
+        /// Backend that timed out, e.g. `"stt"`.
+        backend: &'static str,
+        /// How long it was given, in milliseconds.
+        elapsed_ms: u64,
+    },
     /// The run's cancellation token fired (§2.5.1) — barge-in, ctrl-c, or
     /// a restart. Not a failure: it means "stop, and do not use whatever
     /// you had so far".
