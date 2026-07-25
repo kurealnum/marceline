@@ -22,7 +22,7 @@ use marceline_protocol::stt::{stt_request, stt_response, SttInfoRequest, SttRequ
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Channel;
 
-use super::{SttEngine, SttInfo, Transcript, TranscriptStream};
+use super::{SpeechSignals, SttEngine, SttInfo, Transcript, TranscriptStream};
 use crate::audio::AudioChunk;
 use crate::engine::{AudioStream, EngineError};
 
@@ -314,6 +314,11 @@ fn transcript_from(
         Some(stt_response::Transcript::Final(final_transcript)) => Some(Ok(Transcript::Final {
             text: final_transcript.text,
             confidence: final_transcript.confidence,
+            // Absent on the wire stays absent here; see `SpeechSignals`.
+            signals: SpeechSignals {
+                no_speech_prob: final_transcript.no_speech_prob,
+                avg_logprob: final_transcript.avg_logprob,
+            },
         })),
         Some(stt_response::Transcript::Partial(text)) => Some(Ok(Transcript::Partial(text))),
         None => {

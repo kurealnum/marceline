@@ -46,11 +46,15 @@ SAMPLE_RATE = 16_000
 
 @dataclass
 class FakeTranscription:
-    """Stand-in for `whisper_backend.Transcription`."""
+    """Stand-in for a backend's `Transcription`."""
 
     text: str
     confidence: float
     cancelled: bool = False
+    #: Guard signals (EPIC 3.6). `None` models a backend that cannot report
+    #: one, which must stay distinguishable on the wire from a confident 0.0.
+    no_speech_prob: float | None = None
+    avg_logprob: float | None = None
 
 
 class FakeBackend:
@@ -64,8 +68,16 @@ class FakeBackend:
     name = "fake:test-model"
     sample_rate = SAMPLE_RATE
 
-    def __init__(self, text: str = "hello there", block: bool = False) -> None:
+    def __init__(
+        self,
+        text: str = "hello there",
+        block: bool = False,
+        no_speech_prob: float | None = None,
+        avg_logprob: float | None = None,
+    ) -> None:
         self._text = text
+        self._no_speech_prob = no_speech_prob
+        self._avg_logprob = avg_logprob
         #: When True, `transcribe` waits for the cancel flag instead of
         #: returning immediately, emulating a slow generate loop.
         self._block = block
@@ -87,7 +99,12 @@ class FakeBackend:
                 return FakeTranscription(text="", confidence=0.0, cancelled=True)
         if cancel.is_set():
             return FakeTranscription(text="", confidence=0.0, cancelled=True)
-        return FakeTranscription(text=self._text, confidence=0.75)
+        return FakeTranscription(
+            text=self._text,
+            confidence=0.75,
+            no_speech_prob=self._no_speech_prob,
+            avg_logprob=self._avg_logprob,
+        )
 
 
 def audio_request(pcm: list[float], seq: int, rate: int = SAMPLE_RATE, channels: int = 1):
@@ -267,6 +284,35 @@ class SttWorkerTest(unittest.TestCase):
 
         self.assertEqual(caught.exception.code(), grpc.StatusCode.INTERNAL)
         self.assertIn("CUDA out of memory", caught.exception.details())
+
+    def test_forwards_guard_signals_when_the_backend_reports_them(self) -> None:
+        """`no_speech_prob` / `avg_logprob` reach the Rust guard (EPIC 3.6)."""
+        backend = FakeBackend(no_speech_prob=0.91, avg_logprob=-1.7)
+        stub = self.harness(backend).stub
+
+        responses = list(stub.Transcribe(iter([audio_request([0.1] * 1600, seq=0)])))
+        final = responses[0].final
+
+        self.assertTrue(final.HasField("no_speech_prob"))
+        self.assertAlmostEqual(final.no_speech_prob, 0.91, places=5)
+        self.assertTrue(final.HasField("avg_logprob"))
+        self.assertAlmostEqual(final.avg_logprob, -1.7, places=5)
+
+    def test_omits_guard_signals_the_backend_cannot_report(self) -> None:
+        """Absent must stay distinguishable from a confident zero.
+
+        The HF whisper backend cannot report `no_speech_prob`. If it went out
+        as 0.0 the guard would read "definitely speech" and be disarmed on
+        exactly the backend that needs it most.
+        """
+        stub = self.harness(FakeBackend()).stub
+
+        responses = list(stub.Transcribe(iter([audio_request([0.1] * 1600, seq=0)])))
+        final = responses[0].final
+
+        self.assertFalse(final.HasField("no_speech_prob"))
+        self.assertFalse(final.HasField("avg_logprob"))
+        self.assertEqual(final.no_speech_prob, 0.0, "unset reads as 0.0 by value")
 
     def test_get_info_advertises_final_only(self) -> None:
         """`SttInfo.partials` is false for chunk-based Whisper (§2.4.1)."""

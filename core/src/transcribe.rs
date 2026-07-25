@@ -19,7 +19,8 @@ use futures::StreamExt;
 
 use crate::audio::AudioChunk;
 use crate::engine::{AudioStream, EngineError};
-use crate::stt::{SttEngine, Transcript};
+use crate::stt::guard::{Rejection, SpeechGuard};
+use crate::stt::{SpeechSignals, SttEngine, Transcript};
 
 /// Backend name used in errors raised by this stage.
 const BACKEND: &str = "stt";
@@ -39,6 +40,39 @@ pub const CHUNK_MS: u64 = 100;
 /// seconds; anything approaching this means the worker is wedged.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// What the TRANSCRIBING stage produced for one segment.
+///
+/// Three outcomes, not two, because "the worker failed" and "there was
+/// nothing worth saying" call for different handling even though both stop
+/// the turn: the first is a fault, the second is the empty-transcript ERROR
+/// edge (§2.5) — speak a graceful message, return to IDLE.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TranscribeOutcome {
+    /// Text the LLM should act on.
+    Committed(Transcription),
+    /// Nothing usable: silence, a blip, or a suspected hallucination. Routes
+    /// through the ERROR edge; never forwarded to the LLM.
+    Rejected(Rejection),
+}
+
+impl TranscribeOutcome {
+    /// The committed transcription, or `None` when the segment was rejected.
+    pub fn committed(&self) -> Option<&Transcription> {
+        match self {
+            TranscribeOutcome::Committed(transcription) => Some(transcription),
+            TranscribeOutcome::Rejected(_) => None,
+        }
+    }
+
+    /// Why the segment was rejected, if it was.
+    pub fn rejection(&self) -> Option<Rejection> {
+        match self {
+            TranscribeOutcome::Rejected(rejection) => Some(*rejection),
+            TranscribeOutcome::Committed(_) => None,
+        }
+    }
+}
+
 /// The committed result of transcribing one segment.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Transcription {
@@ -53,6 +87,10 @@ pub struct Transcription {
     /// How many `Final` items the backend emitted. Usually 1; more means
     /// the segment was long enough for the backend to split it.
     pub segments: usize,
+    /// The least reassuring signals seen across the committed segments.
+    /// Retained after the guard has passed them so downstream logging and
+    /// tuning (EPIC 8.3) can see how close a turn came to being rejected.
+    pub signals: SpeechSignals,
 }
 
 impl Transcription {
@@ -78,11 +116,32 @@ pub async fn transcribe_segment(
     engine: &dyn SttEngine,
     segment: AudioChunk,
     timeout: Duration,
-) -> Result<Transcription, EngineError> {
+) -> Result<TranscribeOutcome, EngineError> {
+    transcribe_segment_guarded(engine, segment, timeout, SpeechGuard::default()).await
+}
+
+/// Transcribes one segment, gating the result with `guard`.
+///
+/// The guard is a parameter rather than a global so thresholds can come from
+/// config (EPIC 8.3) and so tests can pin them.
+pub async fn transcribe_segment_guarded(
+    engine: &dyn SttEngine,
+    segment: AudioChunk,
+    timeout: Duration,
+    guard: SpeechGuard,
+) -> Result<TranscribeOutcome, EngineError> {
+    // Cheapest check first: audio too short to hold a word cannot have
+    // produced a real transcript, so there is no reason to spend GPU time
+    // finding out what the model would invent for it (EPIC 3.6).
+    if let Some(rejection) = guard.check_segment(&segment) {
+        tracing::info!(reason = %rejection.reason(), "rejected segment before transcribing");
+        return Ok(TranscribeOutcome::Rejected(rejection));
+    }
+
     let samples = segment.pcm.len();
     let audio = segment_stream(segment);
 
-    match tokio::time::timeout(timeout, collect_finals(engine, audio)).await {
+    match tokio::time::timeout(timeout, collect_finals(engine, audio, guard)).await {
         Ok(result) => result,
         Err(_) => {
             tracing::error!(
@@ -102,20 +161,44 @@ pub async fn transcribe_segment(
 async fn collect_finals(
     engine: &dyn SttEngine,
     audio: AudioStream,
-) -> Result<Transcription, EngineError> {
+    guard: SpeechGuard,
+) -> Result<TranscribeOutcome, EngineError> {
     let mut transcripts = engine.transcribe(audio).await;
 
     let mut texts: Vec<String> = Vec::new();
     let mut confidence = f32::INFINITY;
+    let mut worst_signals = SpeechSignals::default();
+    let mut rejection = None;
 
     while let Some(item) = transcripts.next().await {
         match item? {
-            Transcript::Final { text, confidence: c } => {
+            Transcript::Final {
+                text,
+                confidence: c,
+                signals,
+            } => {
+                // Guarded per segment, not just on the joined text: one
+                // hallucinated stretch inside an otherwise good utterance
+                // still must not reach the LLM.
+                if let Some(reason) = guard.check_transcript(&text, signals) {
+                    // An empty segment between real ones is not itself a
+                    // reason to discard the turn, so `Empty` is only recorded
+                    // as the rejection if nothing else survives.
+                    if !matches!(reason, Rejection::Empty) {
+                        tracing::info!(
+                            reason = %reason.reason(),
+                            "rejected transcript segment"
+                        );
+                        rejection = Some(reason);
+                    }
+                    continue;
+                }
                 let text = text.trim().to_string();
                 if !text.is_empty() {
                     texts.push(text);
                 }
                 confidence = confidence.min(c);
+                worst_signals = worst_of(worst_signals, signals);
             }
             // Never forwarded downstream: revisable text is for UI, debug,
             // and endpointing tuning only (§2.4.1, §9.3).
@@ -125,14 +208,42 @@ async fn collect_finals(
         }
     }
 
+    if texts.is_empty() {
+        // Either everything was rejected, or the backend heard nothing.
+        // Both route through the same ERROR edge (§2.5).
+        return Ok(TranscribeOutcome::Rejected(
+            rejection.unwrap_or(Rejection::Empty),
+        ));
+    }
+
     let segments = texts.len();
-    Ok(Transcription {
+    Ok(TranscribeOutcome::Committed(Transcription {
         text: texts.join(" "),
         // No committed segment means there is no confidence to report;
         // 0.0 reads as "no signal" rather than as certainty.
         confidence: if confidence.is_finite() { confidence } else { 0.0 },
         segments,
-    })
+        signals: worst_signals,
+    }))
+}
+
+/// Keeps the least reassuring of two signal sets.
+///
+/// A turn is only as trustworthy as its weakest segment, so the reported
+/// signals are the highest no-speech probability and the lowest log-prob
+/// seen — the same reasoning as `Transcription::confidence` taking the
+/// minimum.
+fn worst_of(a: SpeechSignals, b: SpeechSignals) -> SpeechSignals {
+    SpeechSignals {
+        no_speech_prob: match (a.no_speech_prob, b.no_speech_prob) {
+            (Some(x), Some(y)) => Some(x.max(y)),
+            (found, None) | (None, found) => found,
+        },
+        avg_logprob: match (a.avg_logprob, b.avg_logprob) {
+            (Some(x), Some(y)) => Some(x.min(y)),
+            (found, None) | (None, found) => found,
+        },
+    }
 }
 
 /// Slices one segment into a stream of [`CHUNK_MS`]-sized chunks.
@@ -247,6 +358,7 @@ mod tests {
             text: "   ".to_string(),
             confidence: 0.9,
             segments: 1,
+            signals: SpeechSignals::default(),
         };
         assert!(blank.is_empty());
     }

@@ -191,9 +191,13 @@ fn stt_config(model: &str) -> SttConfig {
         model: model.to_string(),
         device: Device::Cpu,
         lang: "en".to_string(),
+        guard: Default::default(),
     }
 }
 
+/// A segment long enough to clear the hallucination guard's minimum speech
+/// duration (EPIC 3.6) — sub-250ms audio is rejected before inference, which
+/// is correct behavior but not what these tests are about.
 fn segment(samples: usize) -> AudioChunk {
     AudioChunk {
         seq: 0,
@@ -225,10 +229,13 @@ async fn swapping_the_model_restarts_the_worker_on_the_new_id() {
     // evidence about the running process rather than about config.
     assert_eq!(manager.info().await.name, "large-v3");
     let before = manager
-        .transcribe(segment(1_600), Duration::from_secs(10))
+        .transcribe(segment(16_000), Duration::from_secs(10))
         .await
         .expect("transcribe on the original model");
-    assert_eq!(before.text, "large-v3 heard 1600");
+    assert_eq!(
+        before.committed().expect("should not be rejected").text,
+        "large-v3 heard 16000"
+    );
 
     // The swap itself.
     let info = manager
@@ -241,10 +248,13 @@ async fn swapping_the_model_restarts_the_worker_on_the_new_id() {
     // And the client reconnected transparently: transcription works on the
     // new worker without the caller touching the connection.
     let after = manager
-        .transcribe(segment(3_200), Duration::from_secs(10))
+        .transcribe(segment(32_000), Duration::from_secs(10))
         .await
         .expect("transcribe on the swapped model");
-    assert_eq!(after.text, "small.en heard 3200");
+    assert_eq!(
+        after.committed().expect("should not be rejected").text,
+        "small.en heard 32000"
+    );
 
     assert_eq!(
         fixture.health.read().await.get("stt"),

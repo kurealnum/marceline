@@ -13,6 +13,7 @@
 //! **v1 ships final-only**, and consumers must not assume otherwise.
 
 pub mod grpc;
+pub mod guard;
 pub mod manager;
 
 use std::pin::Pin;
@@ -23,6 +24,7 @@ use futures::Stream;
 use crate::engine::{AudioStream, EngineError};
 
 pub use grpc::GrpcSttEngine;
+pub use guard::{GuardConfig, Rejection, SpeechGuard};
 pub use manager::{SttManager, SttWorkerPaths, SwapError};
 
 /// One transcript item from an STT backend.
@@ -42,7 +44,26 @@ pub enum Transcript {
         text: String,
         /// Backend-reported confidence in `[0, 1]`.
         confidence: f32,
+        /// Signals the hallucination guard gates on (EPIC 3.6).
+        signals: SpeechSignals,
     },
+}
+
+/// Backend-reported evidence that a segment really contained speech.
+///
+/// Both fields are `Option` because a backend that cannot measure a signal
+/// must stay distinguishable from one reporting a confident value: `0.0`
+/// no-speech probability and `0.0` average log-prob are each the most
+/// confident value in their range, so treating "unknown" as either would
+/// silently disarm the guard (EPIC 3.6).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SpeechSignals {
+    /// Probability the model assigned to this segment holding no speech.
+    /// High values behind plausible text are the signature of Whisper
+    /// inventing words on silence.
+    pub no_speech_prob: Option<f32>,
+    /// Mean per-token log probability (`<= 0`; nearer 0 is more confident).
+    pub avg_logprob: Option<f32>,
 }
 
 impl Transcript {
@@ -113,6 +134,7 @@ mod tests {
         let committed = Transcript::Final {
             text: "what time is it".to_string(),
             confidence: 0.9,
+            signals: SpeechSignals::default(),
         };
         assert_eq!(committed.final_text(), Some("what time is it"));
         assert_eq!(Transcript::Partial("what tim".to_string()).final_text(), None);

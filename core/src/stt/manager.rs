@@ -33,7 +33,8 @@ use crate::config::SttConfig;
 use crate::device::Device;
 use crate::engine::EngineError;
 use crate::supervisor::{HealthView, Supervisor, WorkerSpec, WorkerState};
-use crate::transcribe::{transcribe_segment, Transcription};
+use crate::stt::guard::SpeechGuard;
+use crate::transcribe::{transcribe_segment_guarded, TranscribeOutcome};
 
 /// Backend name used in errors raised here.
 const BACKEND: &str = "stt";
@@ -114,6 +115,8 @@ pub struct SttManager {
     engine: Arc<Mutex<GrpcSttEngine>>,
     cancel: CancellationToken,
     lang: String,
+    /// Gates hallucinated and near-silent transcripts (EPIC 3.6).
+    guard: SpeechGuard,
     /// Present only when this process launched the worker. `None` means
     /// there is nothing here to restart, which is why
     /// [`swap_model`][SttManager::swap_model] can fail up front rather than
@@ -154,6 +157,7 @@ impl SttManager {
             engine: Arc::new(Mutex::new(engine)),
             cancel,
             lang: config.lang.clone(),
+            guard: SpeechGuard::new(config.guard),
             supervised: Some(Supervised {
                 spec: spec_tx,
                 health,
@@ -178,6 +182,7 @@ impl SttManager {
             engine: Arc::new(Mutex::new(engine)),
             cancel,
             lang,
+            guard: SpeechGuard::default(),
             supervised: None,
         })
     }
@@ -191,9 +196,9 @@ impl SttManager {
         &self,
         segment: AudioChunk,
         timeout: Duration,
-    ) -> Result<Transcription, EngineError> {
+    ) -> Result<TranscribeOutcome, EngineError> {
         let engine = self.engine.lock().await;
-        transcribe_segment(&*engine, segment, timeout).await
+        transcribe_segment_guarded(&*engine, segment, timeout, self.guard).await
     }
 
     /// Capabilities of the currently loaded model.
@@ -385,6 +390,7 @@ mod tests {
             model: "large-v3".to_string(),
             device: Device::Cuda,
             lang: "en".to_string(),
+            guard: Default::default(),
         };
         let spec = worker_spec(&config, &SttWorkerPaths::for_backend(&config.backend));
 

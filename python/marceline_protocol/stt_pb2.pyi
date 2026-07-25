@@ -39,9 +39,13 @@ class SttResponse(_message.Message):
     def __init__(self, partial: _Optional[str] = ..., final: _Optional[_Union[FinalTranscript, _Mapping]] = ...) -> None: ...
 
 class FinalTranscript(_message.Message):
-    __slots__ = ("text", "confidence")
+    __slots__ = ("text", "confidence", "no_speech_prob", "avg_logprob")
     TEXT_FIELD_NUMBER: _ClassVar[int]
     CONFIDENCE_FIELD_NUMBER: _ClassVar[int]
+    NO_SPEECH_PROB_FIELD_NUMBER: _ClassVar[int]
+    AVG_LOGPROB_FIELD_NUMBER: _ClassVar[int]
     text: str
     confidence: float
-    def __init__(self, text: _Optional[str] = ..., confidence: _Optional[float] = ...) -> None: ...
+    no_speech_prob: float
+    avg_logprob: float
+    def __init__(self, text: _Optional[str] = ..., confidence: _Optional[float] = ..., no_speech_prob: _Optional[float] = ..., avg_logprob: _Optional[float] = ...) -> None: ...

@@ -44,7 +44,11 @@ async fn transcribe_streams_audio_and_yields_a_final_transcript() {
 
     assert_eq!(items.len(), 1);
     match items[0].as_ref().expect("transcript item") {
-        Transcript::Final { text, confidence } => {
+        Transcript::Final {
+            text,
+            confidence,
+            signals: _,
+        } => {
             assert_eq!(text, "what time is it");
             assert!((confidence - 0.82).abs() < 1e-6);
         }
@@ -120,6 +124,10 @@ async fn maps_partials_when_a_backend_advertises_them() {
             Transcript::Final {
                 text: "what time is it".to_string(),
                 confidence: 1.0,
+                signals: marceline_core::stt::SpeechSignals {
+                    no_speech_prob: Some(0.01),
+                    avg_logprob: Some(-0.1),
+                },
             },
         ]
     );
