@@ -58,6 +58,13 @@ class Transcription:
     confidence: float
     #: True when decoding stopped early because of a cooperative cancel.
     cancelled: bool = False
+    #: Highest per-segment probability that this audio held no speech, or
+    #: `None` when unavailable. The maximum rather than the mean: one
+    #: segment the model thinks is silence is enough to be suspicious, and
+    #: averaging would let confident neighbours hide it.
+    no_speech_prob: float | None = None
+    #: Mean per-segment average log probability, or `None` when unavailable.
+    avg_logprob: float | None = None
 
 
 class FasterWhisperBackend:
@@ -140,6 +147,7 @@ class FasterWhisperBackend:
 
         texts: list[str] = []
         logprobs: list[float] = []
+        no_speech_probs: list[float] = []
         for segment in segments:
             if cancel.is_set():
                 # Text decoded so far is a truncated fragment, not a
@@ -149,10 +157,19 @@ class FasterWhisperBackend:
                 return Transcription(text="", confidence=0.0, cancelled=True)
             texts.append(segment.text)
             logprobs.append(segment.avg_logprob)
+            no_speech_probs.append(segment.no_speech_prob)
 
+        finite_logprobs = [value for value in logprobs if np.isfinite(value)]
         return Transcription(
             text="".join(texts).strip(),
             confidence=self._confidence(logprobs),
+            # Reported straight through for the Rust-side hallucination
+            # guard (EPIC 3.6); this runtime gives us both signals per
+            # segment, so neither has to be inferred.
+            no_speech_prob=max(no_speech_probs) if no_speech_probs else None,
+            avg_logprob=(
+                float(np.mean(finite_logprobs)) if finite_logprobs else None
+            ),
         )
 
     def _confidence(self, logprobs: list[float]) -> float:

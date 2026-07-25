@@ -19,6 +19,7 @@ do not need a multi-gigabyte ML stack installed.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 from dataclasses import dataclass
 
@@ -56,6 +57,16 @@ class Transcription:
     confidence: float
     #: True when decoding stopped early because of a cooperative cancel.
     cancelled: bool = False
+    #: Mean per-token log probability, or `None` when scores were
+    #: unavailable. Feeds the Rust-side hallucination guard (EPIC 3.6).
+    avg_logprob: float | None = None
+    #: Always `None` here. `generate()` does not surface a no-speech
+    #: probability, and inferring one from the `<|nospeech|>` token logit
+    #: would be a guess dressed up as a measurement — the field is
+    #: `optional` on the wire so the guard can see it is genuinely
+    #: unavailable and lean on duration and log-prob instead. The
+    #: `faster-whisper` backend does report it.
+    no_speech_prob: float | None = None
 
 
 class _CancelStoppingCriteria(StoppingCriteria):
@@ -183,7 +194,7 @@ class WhisperBackend:
         text = self._processor.batch_decode(
             generated.sequences, skip_special_tokens=True
         )[0].strip()
-        confidence = self._confidence(generated)
+        avg_logprob = self._avg_logprob(generated)
 
         if cancelled:
             # Text decoded up to the cancel point is a truncated
@@ -192,26 +203,35 @@ class WhisperBackend:
             log.info("transcription cancelled after %d tokens", generated.sequences.shape[-1])
             return Transcription(text="", confidence=0.0, cancelled=True)
 
-        return Transcription(text=text, confidence=confidence)
+        return Transcription(
+            text=text,
+            # exp(mean logprob) is the standard sequence-level proxy; 0.0
+            # when the log-prob is unavailable, so a missing signal reads as
+            # "no confidence" rather than as certainty.
+            confidence=(
+                max(0.0, min(1.0, float(math.exp(avg_logprob))))
+                if avg_logprob is not None
+                else 0.0
+            ),
+            avg_logprob=avg_logprob,
+        )
 
-    def _confidence(self, generated: object) -> float:
-        """Derives a `[0, 1]` confidence from per-token log-probs.
+    def _avg_logprob(self, generated: object) -> float | None:
+        """Mean per-token log probability, or `None` if unavailable.
 
-        Uses `exp(mean log P(token))` over the generated tokens — the
-        standard sequence-level proxy. Returns 0.0 when scores are
-        unavailable or non-finite so a missing signal reads as "no
-        confidence" rather than as certainty.
+        Returns `None` rather than a sentinel number so callers — and the
+        Rust-side guard — can tell "the model was unsure" from "we could not
+        measure it".
         """
         try:
             scores = self._model.compute_transition_scores(
                 generated.sequences, generated.scores, normalize_logits=True
             )
-        except Exception:  # noqa: BLE001 - confidence is best-effort telemetry
-            log.debug("confidence unavailable for this segment", exc_info=True)
-            return 0.0
+        except Exception:  # noqa: BLE001 - best-effort telemetry
+            log.debug("token scores unavailable for this segment", exc_info=True)
+            return None
 
         finite = scores[torch.isfinite(scores)]
         if finite.numel() == 0:
-            return 0.0
-        confidence = float(torch.exp(finite.mean()))
-        return max(0.0, min(1.0, confidence))
+            return None
+        return float(finite.mean())

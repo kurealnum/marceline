@@ -227,9 +227,22 @@ class SttServicer(stt_pb2_grpc.SttServicer):
         result = self._backend.transcribe(pcm, cancel)
         if result.cancelled:
             return None
-        return stt_pb2.FinalTranscript(
+
+        # `no_speech_prob` / `avg_logprob` are the signals the Rust side
+        # gates hallucinations on (EPIC 3.6). They are only set when the
+        # backend actually reports them: the fields are `optional` precisely
+        # so "unknown" stays distinguishable from a confident-looking 0.0,
+        # which would read as "definitely speech" and defeat the guard.
+        transcript = stt_pb2.FinalTranscript(
             text=result.text, confidence=result.confidence
         )
+        no_speech_prob = getattr(result, "no_speech_prob", None)
+        if no_speech_prob is not None:
+            transcript.no_speech_prob = no_speech_prob
+        avg_logprob = getattr(result, "avg_logprob", None)
+        if avg_logprob is not None:
+            transcript.avg_logprob = avg_logprob
+        return transcript
 
     def _buffered_samples(self, buffer: list[np.ndarray]) -> int:
         """Sample count buffered so far, counted without concatenating."""

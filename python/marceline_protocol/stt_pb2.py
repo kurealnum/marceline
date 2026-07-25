@@ -25,7 +25,7 @@ _sym_db = _symbol_database.Default()
 from . import common_pb2 as common__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\tstt.proto\x12\rmarceline.stt\x1a\x0c\x63ommon.proto\"\x10\n\x0eSttInfoRequest\"S\n\x07SttInfo\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\r\n\x05langs\x18\x02 \x03(\t\x12\x19\n\x11input_sample_rate\x18\x03 \x01(\r\x12\x10\n\x08partials\x18\x04 \x01(\x08\"r\n\nSttRequest\x12-\n\x05\x61udio\x18\x01 \x01(\x0b\x32\x1c.marceline.common.AudioChunkH\x00\x12*\n\x06\x63\x61ncel\x18\x02 \x01(\x0b\x32\x18.marceline.common.CancelH\x00\x42\t\n\x07payload\"_\n\x0bSttResponse\x12\x11\n\x07partial\x18\x01 \x01(\tH\x00\x12/\n\x05\x66inal\x18\x02 \x01(\x0b\x32\x1e.marceline.stt.FinalTranscriptH\x00\x42\x0c\n\ntranscript\"3\n\x0f\x46inalTranscript\x12\x0c\n\x04text\x18\x01 \x01(\t\x12\x12\n\nconfidence\x18\x02 \x01(\x02\x32\x90\x01\n\x03Stt\x12G\n\nTranscribe\x12\x19.marceline.stt.SttRequest\x1a\x1a.marceline.stt.SttResponse(\x01\x30\x01\x12@\n\x07GetInfo\x12\x1d.marceline.stt.SttInfoRequest\x1a\x16.marceline.stt.SttInfob\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\tstt.proto\x12\rmarceline.stt\x1a\x0c\x63ommon.proto\"\x10\n\x0eSttInfoRequest\"S\n\x07SttInfo\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\r\n\x05langs\x18\x02 \x03(\t\x12\x19\n\x11input_sample_rate\x18\x03 \x01(\r\x12\x10\n\x08partials\x18\x04 \x01(\x08\"r\n\nSttRequest\x12-\n\x05\x61udio\x18\x01 \x01(\x0b\x32\x1c.marceline.common.AudioChunkH\x00\x12*\n\x06\x63\x61ncel\x18\x02 \x01(\x0b\x32\x18.marceline.common.CancelH\x00\x42\t\n\x07payload\"_\n\x0bSttResponse\x12\x11\n\x07partial\x18\x01 \x01(\tH\x00\x12/\n\x05\x66inal\x18\x02 \x01(\x0b\x32\x1e.marceline.stt.FinalTranscriptH\x00\x42\x0c\n\ntranscript\"\x8d\x01\n\x0f\x46inalTranscript\x12\x0c\n\x04text\x18\x01 \x01(\t\x12\x12\n\nconfidence\x18\x02 \x01(\x02\x12\x1b\n\x0eno_speech_prob\x18\x03 \x01(\x02H\x00\x88\x01\x01\x12\x18\n\x0b\x61vg_logprob\x18\x04 \x01(\x02H\x01\x88\x01\x01\x42\x11\n\x0f_no_speech_probB\x0e\n\x0c_avg_logprob2\x90\x01\n\x03Stt\x12G\n\nTranscribe\x12\x19.marceline.stt.SttRequest\x1a\x1a.marceline.stt.SttResponse(\x01\x30\x01\x12@\n\x07GetInfo\x12\x1d.marceline.stt.SttInfoRequest\x1a\x16.marceline.stt.SttInfob\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -40,8 +40,8 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_STTREQUEST']._serialized_end=259
   _globals['_STTRESPONSE']._serialized_start=261
   _globals['_STTRESPONSE']._serialized_end=356
-  _globals['_FINALTRANSCRIPT']._serialized_start=358
-  _globals['_FINALTRANSCRIPT']._serialized_end=409
-  _globals['_STT']._serialized_start=412
-  _globals['_STT']._serialized_end=556
+  _globals['_FINALTRANSCRIPT']._serialized_start=359
+  _globals['_FINALTRANSCRIPT']._serialized_end=500
+  _globals['_STT']._serialized_start=503
+  _globals['_STT']._serialized_end=647
 # @@protoc_insertion_point(module_scope)

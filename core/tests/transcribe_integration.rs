@@ -13,12 +13,13 @@ mod common;
 
 use std::time::Duration;
 
-use common::{unique_socket_path, Behavior, Harness};
+use common::{unique_socket_path, Behavior, FakeSignals, Harness};
 use marceline_core::audio::AudioChunk;
 use marceline_core::config::{VadConfig, WakeConfig};
 use marceline_core::engine::EngineError;
 use marceline_core::stt::GrpcSttEngine;
-use marceline_core::transcribe::{transcribe_segment, DEFAULT_TIMEOUT};
+use marceline_core::stt::{GuardConfig, Rejection, SpeechGuard};
+use marceline_core::transcribe::{transcribe_segment, transcribe_segment_guarded, DEFAULT_TIMEOUT};
 use marceline_core::{
     EnergyWakeDetector, Gate, GateOutput, SileroVad, VadEndpointer, WakeEngine,
     DEFAULT_SPEECH_THRESHOLD,
@@ -144,7 +145,10 @@ async fn a_gate_emitted_segment_becomes_a_final_transcript() {
     let engine = engine_for(&harness).await;
     let transcription = transcribe_segment(&engine, segment.clone(), DEFAULT_TIMEOUT)
         .await
-        .expect("transcription should succeed");
+        .expect("transcription should succeed")
+        .committed()
+        .cloned()
+        .expect("a genuine utterance must not be rejected");
 
     // Text is trimmed on the way out; a leading space in a prompt is noise.
     assert_eq!(transcription.text, "marceline what time is it");
@@ -195,7 +199,10 @@ async fn only_final_transcripts_reach_the_caller() {
     let engine = engine_for(&harness).await;
     let transcription = transcribe_segment(&engine, silence(SAMPLE_RATE as usize), DEFAULT_TIMEOUT)
         .await
-        .expect("transcription should succeed");
+        .expect("transcription should succeed")
+        .committed()
+        .cloned()
+        .expect("should not be rejected");
 
     assert_eq!(transcription.text, "what time is it");
     assert_eq!(transcription.segments, 1, "the partial must not count as a segment");
@@ -254,9 +261,10 @@ async fn a_wedged_worker_times_out_instead_of_hanging() {
 }
 
 #[tokio::test]
-async fn silence_produces_an_empty_transcription_rather_than_an_error() {
-    // A worker that heard nothing and says so is not a failure — it is the
-    // "nothing to answer" case, and the caller decides what to do with it.
+async fn silence_is_rejected_rather_than_treated_as_an_engine_failure() {
+    // A worker that heard nothing and says so is not a fault — it is the
+    // "nothing to answer" case, which routes through the ERROR edge (§2.5)
+    // rather than surfacing as a broken worker.
     let harness = Harness::start(
         "no-speech",
         Behavior::FinalAfterHalfClose {
@@ -267,13 +275,15 @@ async fn silence_produces_an_empty_transcription_rather_than_an_error() {
     .await;
 
     let engine = engine_for(&harness).await;
-    let transcription = transcribe_segment(&engine, silence(1_600), DEFAULT_TIMEOUT)
+    let outcome = transcribe_segment(&engine, silence(SAMPLE_RATE as usize), DEFAULT_TIMEOUT)
         .await
-        .expect("empty speech is not an error at this layer");
+        .expect("empty speech is not an engine error");
 
-    assert!(transcription.is_empty());
-    assert_eq!(transcription.segments, 0);
-    assert_eq!(transcription.confidence, 0.0);
+    // Silence correctly recognized as silence routes through the same
+    // empty-transcript ERROR edge as a rejection (§2.5): either way there is
+    // nothing for the LLM to answer.
+    assert_eq!(outcome.rejection(), Some(Rejection::Empty));
+    assert!(outcome.committed().is_none());
 }
 
 #[tokio::test]
@@ -290,9 +300,12 @@ async fn multiple_final_segments_are_joined_and_scored_conservatively() {
     .await;
 
     let engine = engine_for(&harness).await;
-    let transcription = transcribe_segment(&engine, silence(1_600), DEFAULT_TIMEOUT)
+    let transcription = transcribe_segment(&engine, silence(SAMPLE_RATE as usize), DEFAULT_TIMEOUT)
         .await
-        .expect("transcription should succeed");
+        .expect("transcription should succeed")
+        .committed()
+        .cloned()
+        .expect("should not be rejected");
 
     assert_eq!(transcription.text, "what time is it");
     assert_eq!(transcription.segments, 2);
@@ -322,7 +335,10 @@ async fn a_preexisting_wav_file_transcribes_the_same_way() {
     let engine = engine_for(&harness).await;
     let transcription = transcribe_segment(&engine, segment.clone(), DEFAULT_TIMEOUT)
         .await
-        .expect("transcription should succeed");
+        .expect("transcription should succeed")
+        .committed()
+        .cloned()
+        .expect("should not be rejected");
 
     assert_eq!(transcription.text, "transcribed from a file");
     let received: usize = harness
@@ -331,4 +347,190 @@ async fn a_preexisting_wav_file_transcribes_the_same_way() {
         .map(|chunk| chunk.pcm.len())
         .sum();
     assert_eq!(received, segment.pcm.len());
+}
+
+#[tokio::test]
+async fn a_hallucinated_transcript_on_near_silence_is_rejected() {
+    // The story's first `Done when`, and the failure mode this guard exists
+    // for: Whisper answers near-silence with fluent, plausible text — its
+    // training data's most common filler. The text alone looks fine; only
+    // `no_speech_prob` gives it away. This must never reach the LLM, or
+    // Marceline says "Thank you for watching!" out loud unprompted.
+    let harness = Harness::start(
+        "hallucination",
+        Behavior::FinalWithSignals {
+            text: "Thank you for watching!".to_string(),
+            signals: FakeSignals {
+                no_speech_prob: Some(0.94),
+                avg_logprob: Some(-0.3),
+            },
+        },
+    )
+    .await;
+
+    let engine = engine_for(&harness).await;
+    let outcome = transcribe_segment(&engine, silence(SAMPLE_RATE as usize), DEFAULT_TIMEOUT)
+        .await
+        .expect("a rejection is not an engine error");
+
+    assert!(
+        outcome.committed().is_none(),
+        "a hallucination must not be committed: {outcome:?}"
+    );
+    let rejection = outcome.rejection().expect("expected a rejection");
+    assert!(matches!(rejection, Rejection::NoSpeech { .. }), "got {rejection:?}");
+    // The reason has to name the measurement, or tuning (EPIC 8.3) is blind.
+    assert!(rejection.reason().contains("0.94"), "{}", rejection.reason());
+}
+
+#[tokio::test]
+async fn a_genuine_utterance_passes_the_guard_unaffected() {
+    // The story's second `Done when`. Same code path, real signals.
+    let harness = Harness::start(
+        "genuine",
+        Behavior::FinalWithSignals {
+            text: "marceline what time is it".to_string(),
+            signals: FakeSignals {
+                no_speech_prob: Some(0.02),
+                avg_logprob: Some(-0.18),
+            },
+        },
+    )
+    .await;
+
+    let engine = engine_for(&harness).await;
+    let transcription = transcribe_segment(&engine, silence(SAMPLE_RATE as usize), DEFAULT_TIMEOUT)
+        .await
+        .expect("transcription should succeed")
+        .committed()
+        .cloned()
+        .expect("a genuine utterance must not be rejected");
+
+    assert_eq!(transcription.text, "marceline what time is it");
+    // Signals survive onto the committed transcription, so a turn that
+    // nearly tripped the guard is visible downstream.
+    assert_eq!(transcription.signals.no_speech_prob, Some(0.02));
+    assert_eq!(transcription.signals.avg_logprob, Some(-0.18));
+}
+
+#[tokio::test]
+async fn a_low_confidence_transcript_is_rejected() {
+    let harness = Harness::start(
+        "low-confidence",
+        Behavior::FinalWithSignals {
+            text: "shuffling papers and a door".to_string(),
+            signals: FakeSignals {
+                no_speech_prob: Some(0.2),
+                avg_logprob: Some(-2.8),
+            },
+        },
+    )
+    .await;
+
+    let engine = engine_for(&harness).await;
+    let outcome = transcribe_segment(&engine, silence(SAMPLE_RATE as usize), DEFAULT_TIMEOUT)
+        .await
+        .expect("a rejection is not an engine error");
+
+    assert!(matches!(
+        outcome.rejection(),
+        Some(Rejection::LowConfidence { .. })
+    ));
+}
+
+#[tokio::test]
+async fn a_backend_reporting_no_signals_is_still_trusted() {
+    // The HF whisper worker cannot report no_speech_prob. If missing signals
+    // counted as failure, that backend's every transcript would be dropped —
+    // so absence must not reject on its own. The duration check still applies.
+    let harness = Harness::start(
+        "no-signals",
+        Behavior::FinalWithSignals {
+            text: "what time is it".to_string(),
+            signals: FakeSignals {
+                no_speech_prob: None,
+                avg_logprob: None,
+            },
+        },
+    )
+    .await;
+
+    let engine = engine_for(&harness).await;
+    let transcription = transcribe_segment(&engine, silence(SAMPLE_RATE as usize), DEFAULT_TIMEOUT)
+        .await
+        .expect("transcription should succeed")
+        .committed()
+        .cloned()
+        .expect("missing signals must not cause a rejection");
+
+    assert_eq!(transcription.text, "what time is it");
+    assert_eq!(transcription.signals.no_speech_prob, None);
+}
+
+#[tokio::test]
+async fn a_too_short_segment_is_rejected_without_calling_the_backend() {
+    // The duration check runs before inference, so a blip costs no GPU time.
+    // Asserted by the worker never receiving any audio at all.
+    let harness = Harness::start(
+        "too-short",
+        Behavior::FinalWithSignals {
+            text: "you".to_string(),
+            signals: FakeSignals::default(),
+        },
+    )
+    .await;
+
+    let engine = engine_for(&harness).await;
+    // 100ms, under the 250ms floor.
+    let outcome = transcribe_segment(&engine, silence(1_600), DEFAULT_TIMEOUT)
+        .await
+        .expect("a rejection is not an engine error");
+
+    assert!(matches!(
+        outcome.rejection(),
+        Some(Rejection::TooShort { .. })
+    ));
+    assert!(
+        harness.received_chunks().is_empty(),
+        "no audio should have been sent to the worker"
+    );
+}
+
+#[tokio::test]
+async fn guard_thresholds_are_configurable() {
+    // Tuning is EPIC 8.3's job, so the same audio and signals must be able
+    // to pass or fail purely on config.
+    let harness = Harness::start(
+        "configurable",
+        Behavior::FinalWithSignals {
+            text: "borderline".to_string(),
+            signals: FakeSignals {
+                no_speech_prob: Some(0.5),
+                avg_logprob: Some(-0.8),
+            },
+        },
+    )
+    .await;
+    let engine = engine_for(&harness).await;
+    let segment = silence(SAMPLE_RATE as usize);
+
+    // Default thresholds accept it.
+    let accepted = transcribe_segment(&engine, segment.clone(), DEFAULT_TIMEOUT)
+        .await
+        .expect("should not error");
+    assert!(accepted.committed().is_some(), "{accepted:?}");
+
+    // A stricter guard rejects the very same result.
+    let strict = SpeechGuard::new(GuardConfig {
+        min_speech_ms: 250,
+        max_no_speech_prob: 0.3,
+        min_avg_logprob: -1.0,
+    });
+    let rejected = transcribe_segment_guarded(&engine, segment, DEFAULT_TIMEOUT, strict)
+        .await
+        .expect("should not error");
+    assert!(matches!(
+        rejected.rejection(),
+        Some(Rejection::NoSpeech { .. })
+    ));
 }

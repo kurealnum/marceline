@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use marceline_core::stt::SttWorkerPaths;
-use marceline_core::transcribe::{Transcription, DEFAULT_TIMEOUT};
+use marceline_core::transcribe::{TranscribeOutcome, Transcription, DEFAULT_TIMEOUT};
 use marceline_core::{read_wav, Config, HealthView, SttManager};
 use tokio::sync::{watch, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -35,11 +35,19 @@ pub enum TranscribeFileError {
     /// The STT worker was unreachable, failed, or timed out.
     #[error(transparent)]
     Engine(#[from] marceline_core::EngineError),
-    /// The worker answered, but committed no text.
-    #[error("no speech recognized in {path}")]
-    NoSpeech {
-        /// File that produced no transcript.
+    /// The transcript was rejected before reaching the LLM (EPIC 3.6).
+    ///
+    /// Reported as a failure rather than as empty output because it is the
+    /// empty-transcript ERROR edge (§2.5): in the daemon this speaks a
+    /// graceful message and returns to IDLE, and on the command line the
+    /// equivalent is a message and a non-zero exit — never a blank line that
+    /// looks like success.
+    #[error("no usable speech in {path}: {reason}")]
+    Rejected {
+        /// File that produced no usable transcript.
         path: String,
+        /// Which check rejected it, and the measurement behind it.
+        reason: String,
     },
 }
 
@@ -109,11 +117,11 @@ pub async fn transcribe_file(
     // outlive the command that started it.
     let _ = shutdown_tx.send(true);
 
-    let transcription = result?;
-    if transcription.is_empty() {
-        return Err(TranscribeFileError::NoSpeech {
+    match result? {
+        TranscribeOutcome::Committed(transcription) => Ok(transcription),
+        TranscribeOutcome::Rejected(rejection) => Err(TranscribeFileError::Rejected {
             path: path.display().to_string(),
-        });
+            reason: rejection.reason(),
+        }),
     }
-    Ok(transcription)
 }

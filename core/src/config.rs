@@ -63,6 +63,13 @@ pub struct SttConfig {
     pub device: Device,
     /// Recognition language. v1 is English-only.
     pub lang: String,
+    /// Silence/hallucination guard thresholds (EPIC 3.6).
+    ///
+    /// Defaults when absent, so a config file written before these knobs
+    /// existed still loads — and still gets a guard, since silently running
+    /// unguarded would be the worse failure.
+    #[serde(default)]
+    pub guard: crate::stt::guard::GuardConfig,
 }
 
 /// LLM backend configuration (`[llm]`).
@@ -419,6 +426,45 @@ log = true
         assert_eq!(
             config.memory.expanded_db_path().to_string_lossy(),
             format!("{}/.marceline/history.db", env::var("HOME").unwrap())
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn stt_guard_defaults_when_the_section_is_absent() {
+        // A config written before the guard knobs existed must still load —
+        // and must still get a guard, since running unguarded silently is
+        // the worse failure (EPIC 3.6).
+        let path = scratch_path("guard-default.toml");
+        fs::write(&path, VALID_V1).unwrap();
+        let config = Config::load(&path).expect("valid config should load");
+
+        assert_eq!(config.stt.guard, crate::stt::GuardConfig::default());
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn stt_guard_thresholds_can_be_overridden_individually() {
+        let path = scratch_path("guard-override.toml");
+        fs::write(
+            &path,
+            VALID_V1.replace(
+                "[llm]",
+                "[stt.guard]\nmax_no_speech_prob = 0.4\n\n[llm]",
+            ),
+        )
+        .unwrap();
+        let config = Config::load(&path).expect("valid config should load");
+
+        assert_eq!(config.stt.guard.max_no_speech_prob, 0.4);
+        // Untouched knobs keep their defaults rather than zeroing out.
+        assert_eq!(
+            config.stt.guard.min_speech_ms,
+            crate::stt::guard::DEFAULT_MIN_SPEECH_MS
+        );
+        assert_eq!(
+            config.stt.guard.min_avg_logprob,
+            crate::stt::guard::DEFAULT_MIN_AVG_LOGPROB
         );
         fs::remove_file(&path).ok();
     }

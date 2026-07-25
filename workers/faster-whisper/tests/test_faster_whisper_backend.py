@@ -36,6 +36,9 @@ class FakeSegment:
 
     text: str
     avg_logprob: float
+    #: This runtime reports a per-segment no-speech probability, which the
+    #: Rust guard gates hallucinations on (EPIC 3.6).
+    no_speech_prob: float = 0.01
 
 
 class FakeWhisperModel:
@@ -178,6 +181,29 @@ class FasterWhisperBackendTest(unittest.TestCase):
             len(model.segments),
             "decoding should have stopped before the last segment",
         )
+
+    def test_reports_guard_signals(self) -> None:
+        """Both signals reach the caller for the Rust guard (EPIC 3.6)."""
+        backend, _ = loaded_backend(
+            [
+                FakeSegment("one", -0.2, no_speech_prob=0.05),
+                FakeSegment("two", -0.4, no_speech_prob=0.30),
+            ]
+        )
+        result = backend.transcribe(np.zeros(1_600, dtype=np.float32), threading.Event())
+
+        # The *worst* of each: one suspicious segment is enough to be worth
+        # flagging, and averaging would let confident neighbours hide it.
+        self.assertAlmostEqual(result.no_speech_prob, 0.30, places=5)
+        self.assertAlmostEqual(result.avg_logprob, -0.3, places=5)
+
+    def test_signals_are_none_when_nothing_was_decoded(self) -> None:
+        """Absent stays absent rather than becoming a confident zero."""
+        backend, _ = loaded_backend([])
+        result = backend.transcribe(np.zeros(1_600, dtype=np.float32), threading.Event())
+
+        self.assertIsNone(result.no_speech_prob)
+        self.assertIsNone(result.avg_logprob)
 
     def test_confidence_is_zero_when_there_is_no_signal(self) -> None:
         """Missing scores read as no confidence, never as certainty."""

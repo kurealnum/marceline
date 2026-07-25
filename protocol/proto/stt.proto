@@ -65,4 +65,18 @@ message FinalTranscript {
   string text = 1;
   // Backend-reported confidence in [0, 1].
   float confidence = 2;
+  // Probability the model assigns to this segment containing no speech.
+  // High values on plausible-looking text are the signature of Whisper's
+  // invent-text-on-silence failure mode, so the Rust side gates on it
+  // (EPIC 3.6).
+  //
+  // `optional` for real presence tracking: a backend that cannot report
+  // this must be distinguishable from one reporting 0.0, or "unknown"
+  // would read as "definitely speech" and defeat the guard.
+  optional float no_speech_prob = 3;
+  // Mean per-token log probability for this segment (<= 0; nearer 0 is
+  // more confident). Also `optional`, for the same reason: 0.0 is the most
+  // confident value there is, which is a dangerous default for a missing
+  // signal.
+  optional float avg_logprob = 4;
 }

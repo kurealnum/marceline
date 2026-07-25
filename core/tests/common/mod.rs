@@ -36,11 +36,32 @@ pub fn unique_socket_path(name: &str) -> PathBuf {
     ))
 }
 
+/// Speech signals a fake worker reports on its finals.
+///
+/// Defaults to "clearly speech" so existing tests are unaffected by the
+/// hallucination guard (EPIC 3.6); guard tests override it.
+#[derive(Clone, Copy)]
+pub struct FakeSignals {
+    pub no_speech_prob: Option<f32>,
+    pub avg_logprob: Option<f32>,
+}
+
+impl Default for FakeSignals {
+    fn default() -> Self {
+        Self {
+            no_speech_prob: Some(0.01),
+            avg_logprob: Some(-0.1),
+        }
+    }
+}
+
 /// What a fake worker should do when it gets a `Transcribe` stream.
 #[derive(Clone)]
 pub enum Behavior {
     /// Consume the request stream, then emit one `final`.
     FinalAfterHalfClose { text: String, confidence: f32 },
+    /// Emit one `final` carrying the given speech signals, for guard tests.
+    FinalWithSignals { text: String, signals: FakeSignals },
     /// Emit a `partial` before the `final`, as a partials-capable backend
     /// would. Used to prove the client maps both variants.
     PartialThenFinal { partial: String, text: String },
@@ -59,6 +80,18 @@ pub enum Behavior {
     /// Accept the audio and then never answer, modelling a wedged worker.
     /// Nothing but a timeout gets the caller out of this.
     Hang,
+}
+
+/// Builds one `final` response with the given text, confidence and signals.
+fn final_response(text: String, confidence: f32, signals: FakeSignals) -> SttResponse {
+    SttResponse {
+        transcript: Some(stt_response::Transcript::Final(FinalTranscript {
+            text,
+            confidence,
+            no_speech_prob: signals.no_speech_prob,
+            avg_logprob: signals.avg_logprob,
+        })),
+    }
 }
 
 /// Fake `Stt` server standing in for the Python worker.
@@ -103,14 +136,11 @@ impl Stt for FakeWorker {
                         *saw_cancel.lock().unwrap() = true;
                         if let Behavior::FinalDespiteCancel { text } = &behavior {
                             let _ = tx
-                                .send(Ok(SttResponse {
-                                    transcript: Some(stt_response::Transcript::Final(
-                                        FinalTranscript {
-                                            text: text.clone(),
-                                            confidence: 1.0,
-                                        },
-                                    )),
-                                }))
+                                .send(Ok(final_response(
+                                    text.clone(),
+                                    1.0,
+                                    FakeSignals::default(),
+                                )))
                                 .await;
                         }
                         // Real worker behavior: stop, emit nothing.
@@ -123,13 +153,11 @@ impl Stt for FakeWorker {
             match behavior {
                 Behavior::FinalAfterHalfClose { text, confidence } => {
                     let _ = tx
-                        .send(Ok(SttResponse {
-                            transcript: Some(stt_response::Transcript::Final(FinalTranscript {
-                                text,
-                                confidence,
-                            })),
-                        }))
+                        .send(Ok(final_response(text, confidence, FakeSignals::default())))
                         .await;
+                }
+                Behavior::FinalWithSignals { text, signals } => {
+                    let _ = tx.send(Ok(final_response(text, 0.5, signals))).await;
                 }
                 Behavior::PartialThenFinal { partial, text } => {
                     let _ = tx
@@ -138,22 +166,17 @@ impl Stt for FakeWorker {
                         }))
                         .await;
                     let _ = tx
-                        .send(Ok(SttResponse {
-                            transcript: Some(stt_response::Transcript::Final(FinalTranscript {
-                                text,
-                                confidence: 1.0,
-                            })),
-                        }))
+                        .send(Ok(final_response(text, 1.0, FakeSignals::default())))
                         .await;
                 }
                 Behavior::MultipleFinals(finals) => {
                     for (text, confidence) in finals {
                         let _ = tx
-                            .send(Ok(SttResponse {
-                                transcript: Some(stt_response::Transcript::Final(
-                                    FinalTranscript { text, confidence },
-                                )),
-                            }))
+                            .send(Ok(final_response(
+                                text,
+                                confidence,
+                                FakeSignals::default(),
+                            )))
                             .await;
                     }
                 }
