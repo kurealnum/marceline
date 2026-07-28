@@ -9,6 +9,7 @@ use std::sync::Arc;
 use marceline_core::{Device, HealthView, Supervisor, WorkerSpec};
 use tokio::sync::{watch, RwLock};
 
+mod say_to_llm;
 mod transcribe;
 
 /// Default config file, relative to the working directory. The full
@@ -36,6 +37,7 @@ fn main() -> ExitCode {
 
     match args.get(1).map(String::as_str) {
         Some("transcribe") => runtime.block_on(run_transcribe(&args)),
+        Some("say-to-llm") => runtime.block_on(run_say_to_llm(&args)),
         Some("config") => run_config(&args),
         Some("--help") | Some("-h") => {
             print_usage();
@@ -62,6 +64,7 @@ fn print_usage() {
 Usage:
   marceline                            Run the daemon
   marceline transcribe <file.wav>      Transcribe a wav file and print the text
+  marceline say-to-llm <text>          Stream an LLM reply to text, per [llm] config
   marceline config get <key>           Print a config value
   marceline config set <key> <value>   Change a config value
   marceline --version                  Print the version
@@ -70,10 +73,12 @@ Settable keys: {keys}
 
 Options:
   --config <path>   Config file (default {DEFAULT_CONFIG})
+  --soul <path>     SOUL.md path for say-to-llm (default {soul_default})
   --socket <path>   Attach to an already-running STT worker instead of
                     launching one from config (e.g. /tmp/marceline-stt.sock)
   --verbose         Debug-level logging",
-        keys = SETTABLE_KEYS.join(", ")
+        keys = SETTABLE_KEYS.join(", "),
+        soul_default = say_to_llm::DEFAULT_SOUL,
     );
 }
 
@@ -112,6 +117,39 @@ async fn run_transcribe(args: &[String]) -> ExitCode {
         }
         Err(err) => {
             eprintln!("transcription failed: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Runs `marceline say-to-llm <text>` (EPIC 4.1, 4.2).
+///
+/// Streams the reply to stdout as it arrives — the whole point of 4.1's
+/// streaming contract is that a caller does not have to wait for the full
+/// response before showing anything.
+async fn run_say_to_llm(args: &[String]) -> ExitCode {
+    let Some(text) = args.get(2).filter(|arg| !arg.starts_with('-')) else {
+        eprintln!("say-to-llm requires text to send");
+        print_usage();
+        return ExitCode::FAILURE;
+    };
+
+    let config_path =
+        PathBuf::from(flag_value(args, "--config").unwrap_or_else(|| DEFAULT_CONFIG.to_string()));
+    let soul_path = say_to_llm::soul_path_from_args(args);
+
+    match say_to_llm::say_to_llm(&config_path, &soul_path, text).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(say_to_llm::SayToLlmError::Engine(err)) if err.is_guardrail_refused() => {
+            // The graceful spoken message this refusal maps to on the
+            // ERROR edge (§2.5, §9.11) once an orchestrator exists to
+            // speak it; on the command line the equivalent is a plain,
+            // non-panicked message rather than a raw error dump.
+            println!("I can't do that right now — {err}");
+            ExitCode::FAILURE
+        }
+        Err(err) => {
+            eprintln!("say-to-llm failed: {err}");
             ExitCode::FAILURE
         }
     }

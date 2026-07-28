@@ -7,6 +7,7 @@ pub mod device;
 pub mod engine;
 pub mod gate;
 pub mod ipc;
+pub mod llm;
 pub mod logging;
 pub mod stt;
 pub mod supervisor;
@@ -23,6 +24,11 @@ pub use config_edit::ConfigEditError;
 pub use device::Device;
 pub use engine::{AudioStream, EngineError};
 pub use gate::{Gate, GateOutput, GateState};
+pub use llm::{
+    compile_system_prompt, ChatEvent, ChatEventStream, ChatRequest, DropOldestTurn, FinishReason,
+    LlmEngine, LlmInfo, MemoryEntry, Message, OpenAiCompatibleEngine, Role, SessionGuard,
+    ToolSpec, TrimPolicy, Trust, TurnBuffer,
+};
 pub use stt::{
     GrpcSttEngine, SttEngine, SttInfo, SttManager, SttWorkerPaths, SwapError, Transcript,
     TranscriptStream,

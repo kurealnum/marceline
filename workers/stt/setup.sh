@@ -11,7 +11,19 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${ROOT}/../.." && pwd)"
 VENV_DIR="${ROOT}/.venv"
 
-python3 -m venv "${VENV_DIR}"
+# torch==2.4.1 (pinned below) has no wheels past cp312, so the venv must be
+# built with a specific interpreter rather than whatever `python3` resolves
+# to on the host (e.g. 3.14).
+PYTHON_BIN="$(command -v python3.12 || true)"
+if [[ -z "${PYTHON_BIN}" ]] && command -v pyenv >/dev/null; then
+  PYTHON_BIN="$(pyenv root)/versions/3.12.11/bin/python3.12"
+fi
+if [[ -z "${PYTHON_BIN}" || ! -x "${PYTHON_BIN}" ]]; then
+  echo "error: python3.12 not found. Install it (e.g. 'pyenv install 3.12.11') and retry." >&2
+  exit 1
+fi
+
+"${PYTHON_BIN}" -m venv "${VENV_DIR}"
 "${VENV_DIR}/bin/pip" install --upgrade pip >/dev/null
 "${VENV_DIR}/bin/pip" install -r "${ROOT}/requirements.txt"
 
