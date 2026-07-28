@@ -209,6 +209,17 @@ where
         }
 
         for call in &round.tool_calls {
+            // Checked before dispatching each call, not just once after
+            // the loop: a barge-in mid-round must stop the *remaining*
+            // calls from ever starting, not merely be noticed afterward
+            // (§2.5.1). Each tool's own `call()` already races this same
+            // token internally and returns promptly once it fires — this
+            // is the outer guard that also stops us from bothering to
+            // dispatch further calls at all.
+            if cancel.is_cancelled() {
+                return Err(EngineError::Cancelled { backend: "llm" });
+            }
+
             if requires_confirmation(broker.safety_class(&call.name)) {
                 let prompt = format!("Should I run {}? Say yes to confirm.", call.name);
                 if !confirm.confirm(&prompt).await {
@@ -219,14 +230,22 @@ where
 
             let args = serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::Null);
             let result = broker.dispatch(&call.name, args, cancel.clone()).await;
+
+            // Checked again immediately after: the call may have been
+            // aborted mid-flight by this same token, or have finished
+            // just as it fired. Either way, per §2.5.1's partial-state
+            // policy, a result produced under a cancelled run must never
+            // reach the model — discard it and stop, rather than feeding
+            // it back and looping to another chat request the user has
+            // already interrupted.
+            if cancel.is_cancelled() {
+                return Err(EngineError::Cancelled { backend: "llm" });
+            }
+
             messages.push(Message::tool_result(call.id.clone(), tool_result_content(result)));
         }
 
         iterations += 1;
-
-        // A barge-in firing mid-tool-dispatch should stop the loop before
-        // it starts another round trip, rather than doing one more full
-        // request the user has already interrupted.
         if cancel.is_cancelled() {
             return Err(EngineError::Cancelled { backend: "llm" });
         }
