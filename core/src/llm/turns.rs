@@ -102,10 +102,7 @@ impl TurnBuffer {
 
     /// Appends a user turn.
     pub fn push_user(&mut self, text: impl Into<String>) {
-        self.turns.push(Message {
-            role: Role::User,
-            content: text.into(),
-        });
+        self.turns.push(Message::new(Role::User, text));
     }
 
     /// Appends the model's final assistant turn.
@@ -114,10 +111,7 @@ impl TurnBuffer {
     /// round-trips are the tool broker's concern (EPIC 6), not turn
     /// management's.
     pub fn push_assistant(&mut self, text: impl Into<String>) {
-        self.turns.push(Message {
-            role: Role::Assistant,
-            content: text.into(),
-        });
+        self.turns.push(Message::new(Role::Assistant, text));
     }
 
     /// Trims the buffer to fit `context_window` alongside `system_prompt`,
@@ -132,10 +126,7 @@ impl TurnBuffer {
             .trim(&mut self.turns, system_prompt_tokens, context_window);
 
         let mut messages = Vec::with_capacity(self.turns.len() + 1);
-        messages.push(Message {
-            role: Role::System,
-            content: system_prompt.to_string(),
-        });
+        messages.push(Message::new(Role::System, system_prompt));
         messages.extend(self.turns.iter().cloned());
         messages
     }
@@ -151,10 +142,7 @@ mod tests {
     use super::*;
 
     fn long_turn(role: Role, chars: usize) -> Message {
-        Message {
-            role,
-            content: "a".repeat(chars),
-        }
+        Message::new(role, "a".repeat(chars))
     }
 
     #[test]

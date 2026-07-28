@@ -11,6 +11,7 @@ pub mod llm;
 pub mod logging;
 pub mod stt;
 pub mod supervisor;
+pub mod thinking;
 pub mod tools;
 pub mod transcribe;
 pub mod tts;
@@ -29,13 +30,14 @@ pub use gate::{Gate, GateOutput, GateState};
 pub use llm::{
     compile_system_prompt, ChatEvent, ChatEventStream, ChatRequest, DropOldestTurn, FinishReason,
     LlmEngine, LlmInfo, MemoryEntry, Message, OpenAiCompatibleEngine, Role, SessionGuard,
-    ToolSpec, TrimPolicy, Trust, TurnBuffer,
+    ToolCallRequest, ToolSpec, TrimPolicy, Trust, TurnBuffer,
 };
 pub use stt::{
     GrpcSttEngine, SttEngine, SttInfo, SttManager, SttWorkerPaths, SwapError, Transcript,
     TranscriptStream,
 };
 pub use supervisor::{HealthView, Supervisor, WorkerSpec, WorkerState};
+pub use thinking::{resolve_max_iterations, think, ThinkingOutcome, MAX_TOOL_ITERS_ENV};
 pub use tools::{
     DuplicateToolError, GetTimeTool, ListDirTool, ReadFileTool, SafetyClass, Tool, ToolBroker,
     ToolResult, WebSearchTool,
