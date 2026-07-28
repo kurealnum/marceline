@@ -174,20 +174,26 @@ class WhisperBackend:
             pcm, sampling_rate=self.sample_rate, return_tensors="pt"
         ).input_features.to(self._device, dtype=self._model.dtype)
 
+        # English-only checkpoints (model id ending `.en`, e.g. `small.en`)
+        # reject `language`/`task` outright -- there's only one language to
+        # pin. Multilingual checkpoints still get it pinned from config
+        # rather than detected: v1 is English-only, and letting Whisper
+        # guess is a known source of spurious language switches on short,
+        # noisy segments.
+        generate_kwargs = {}
+        if not self._model_id.endswith(".en"):
+            generate_kwargs["language"] = self._lang
+            generate_kwargs["task"] = "transcribe"
+
         with torch.inference_mode():
             generated = self._model.generate(
                 features,
-                # Language is pinned from config rather than detected:
-                # v1 is English-only, and letting Whisper guess is a
-                # known source of spurious language switches on short,
-                # noisy segments.
-                language=self._lang,
-                task="transcribe",
                 stopping_criteria=StoppingCriteriaList(
                     [_CancelStoppingCriteria(cancel)]
                 ),
                 output_scores=True,
                 return_dict_in_generate=True,
+                **generate_kwargs,
             )
 
         cancelled = cancel.is_set()
