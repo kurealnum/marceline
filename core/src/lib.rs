@@ -36,7 +36,10 @@ pub use stt::{
     TranscriptStream,
 };
 pub use supervisor::{HealthView, Supervisor, WorkerSpec, WorkerState};
-pub use tools::{DuplicateToolError, SafetyClass, Tool, ToolBroker, ToolResult};
+pub use tools::{
+    DuplicateToolError, GetTimeTool, ListDirTool, ReadFileTool, SafetyClass, Tool, ToolBroker,
+    ToolResult, WebSearchTool,
+};
 pub use transcribe::{transcribe_segment, Transcription};
 pub use tts::{
     launch as launch_tts_worker, play, sentence_chunk, GrpcTtsEngine, PlaybackSink, TextStream,
