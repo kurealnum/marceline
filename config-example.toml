@@ -1,0 +1,44 @@
+version = 1
+
+[stt]
+backend = "whisper"
+model = "large-v3"
+device = "cuda"
+lang = "en"
+
+[stt.guard]
+min_speech_ms = 250
+max_no_speech_prob = 0.6
+min_avg_logprob = -1.0
+
+[llm]
+backend = "openai-compatible"
+base_url = "http://localhost:1234/v1"
+model = "local-model"
+api_key_env = "MARCELINE_LLM_KEY"
+max_tokens_per_turn = 2048
+max_requests_per_session = 200
+max_tool_iterations_per_turn = 8
+
+[tts]
+backend = "kokoro"
+voice = "af_sky"
+device = "cuda"
+
+[wake]
+words = ["marceline", "marcy"]
+sensitivity = 0.6
+
+[vad]
+silence_ms = 700
+min_utterance_ms = 300
+max_utterance_ms = 15000
+
+[memory]
+db_path = "~/.marceline/history.db"
+longterm = true
+embed_model = "sentence-transformers/all-MiniLM-L6-v2"
+embed_device = "cpu"
+
+[egress]
+log = true

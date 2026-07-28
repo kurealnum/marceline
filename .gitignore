@@ -4,3 +4,7 @@
 .venv/
 __pycache__/
 *.pyc
+
+# Local runtime config (copy config-example.toml to get started)
+config.toml
+.env
