@@ -14,6 +14,7 @@
 
 pub mod openai;
 pub mod prompt;
+pub mod turns;
 
 use std::pin::Pin;
 
@@ -24,6 +25,7 @@ use crate::engine::EngineError;
 
 pub use openai::OpenAiCompatibleEngine;
 pub use prompt::{compile_system_prompt, MemoryEntry, Trust};
+pub use turns::{DropOldestTurn, TrimPolicy, TurnBuffer};
 
 /// One entry in a chat conversation sent to the backend.
 #[derive(Debug, Clone, PartialEq)]

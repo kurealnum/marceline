@@ -25,8 +25,9 @@ pub use device::Device;
 pub use engine::{AudioStream, EngineError};
 pub use gate::{Gate, GateOutput, GateState};
 pub use llm::{
-    compile_system_prompt, ChatEvent, ChatEventStream, ChatRequest, FinishReason, LlmEngine,
-    LlmInfo, MemoryEntry, Message, OpenAiCompatibleEngine, Role, ToolSpec, Trust,
+    compile_system_prompt, ChatEvent, ChatEventStream, ChatRequest, DropOldestTurn, FinishReason,
+    LlmEngine, LlmInfo, MemoryEntry, Message, OpenAiCompatibleEngine, Role, ToolSpec, TrimPolicy,
+    Trust, TurnBuffer,
 };
 pub use stt::{
     GrpcSttEngine, SttEngine, SttInfo, SttManager, SttWorkerPaths, SwapError, Transcript,
