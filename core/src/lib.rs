@@ -9,6 +9,7 @@ pub mod gate;
 pub mod ipc;
 pub mod llm;
 pub mod logging;
+pub mod mcp;
 pub mod stt;
 pub mod supervisor;
 pub mod thinking;
@@ -32,6 +33,7 @@ pub use llm::{
     LlmEngine, LlmInfo, MemoryEntry, Message, OpenAiCompatibleEngine, Role, SessionGuard,
     ToolCallRequest, ToolSpec, TrimPolicy, Trust, TurnBuffer,
 };
+pub use mcp::{register_mcp_tools, McpCallOutcome, McpClient, McpError, McpTool, McpToolInfo};
 pub use stt::{
     GrpcSttEngine, SttEngine, SttInfo, SttManager, SttWorkerPaths, SwapError, Transcript,
     TranscriptStream,
