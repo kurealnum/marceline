@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use futures::StreamExt;
 use marceline_core::{
     compile_system_prompt, ChatEvent, ChatRequest, Config, LlmEngine, OpenAiCompatibleEngine,
-    TurnBuffer,
+    SessionGuard, TurnBuffer,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -45,6 +45,14 @@ pub async fn say_to_llm(
 
     let cancel = CancellationToken::new();
     let engine = OpenAiCompatibleEngine::new(&config.llm, cancel)?;
+    // Cost/rate guardrail (§4.5): caps this run to the configured
+    // per-turn token budget and per-session request count, refusing
+    // rather than calling the backend once either is exhausted.
+    let engine = SessionGuard::new(
+        engine,
+        config.llm.max_tokens_per_turn,
+        config.llm.max_requests_per_session,
+    );
     let info = engine.info();
 
     // One-shot CLI run: a single turn, but routed through `TurnBuffer` so
