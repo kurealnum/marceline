@@ -82,7 +82,7 @@ The contract tests, shared by every TTS backend, live once in
   model's actual rate, not a guess (§2.4.1's chipmunk-bug warning).
 - **Cooperative cancel.** The request stream is drained on a reader
   thread; a `Cancel` arriving mid-synthesis sets a flag the generate loop
-  checks between raw audio frames and returns early (§2.5.1).
+  checks between per-sentence audio chunks and returns early (§2.5.1).
 - **In-band errors.** Worker-side failures abort the stream with
   `INTERNAL`, which the Rust client sees as a stream `Err` item
   (invariant 1).
