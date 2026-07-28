@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 
 use futures::StreamExt;
 use marceline_core::{
-    compile_system_prompt, ChatEvent, ChatRequest, Config, LlmEngine, Message,
-    OpenAiCompatibleEngine, Role,
+    compile_system_prompt, ChatEvent, ChatRequest, Config, LlmEngine, OpenAiCompatibleEngine,
+    TurnBuffer,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -45,30 +45,31 @@ pub async fn say_to_llm(
 
     let cancel = CancellationToken::new();
     let engine = OpenAiCompatibleEngine::new(&config.llm, cancel)?;
+    let info = engine.info();
+
+    // One-shot CLI run: a single turn, but routed through `TurnBuffer` so
+    // the context-window trimming this session would eventually need is
+    // exercised the same way the daemon's multi-turn conversations are.
+    let mut turns = TurnBuffer::new();
+    turns.push_user(text);
+    let messages = turns.messages_for_request(&system_prompt, info.context_window);
 
     let request = ChatRequest {
-        messages: vec![
-            Message {
-                role: Role::System,
-                content: system_prompt,
-            },
-            Message {
-                role: Role::User,
-                content: text.to_string(),
-            },
-        ],
+        messages,
         tools: vec![],
         max_tokens: config.llm.max_tokens_per_turn,
     };
 
     let mut stream = engine.chat(request).await;
     let mut stdout = std::io::stdout();
+    let mut reply = String::new();
 
     while let Some(event) = stream.next().await {
         match event? {
             ChatEvent::TextDelta(delta) => {
                 let _ = stdout.write_all(delta.as_bytes());
                 let _ = stdout.flush();
+                reply.push_str(&delta);
             }
             ChatEvent::ToolCallDelta { .. } | ChatEvent::ToolCallDone { .. } => {
                 // No tool broker wired up to `say-to-llm` yet (EPIC 6); the
@@ -80,6 +81,7 @@ pub async fn say_to_llm(
         }
     }
     println!();
+    turns.push_assistant(reply);
 
     Ok(())
 }
