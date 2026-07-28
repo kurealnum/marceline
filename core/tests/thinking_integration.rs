@@ -123,13 +123,33 @@ fn test_config(base_url: String) -> LlmConfig {
 /// A stub tool recording every call it receives, for asserting dispatch
 /// happened (or didn't) without depending on a real built-in's output.
 struct RecordingTool {
+    name: &'static str,
+    class: SafetyClass,
     calls: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+impl RecordingTool {
+    fn get_time(calls: Arc<Mutex<Vec<serde_json::Value>>>) -> Self {
+        Self {
+            name: "get_time",
+            class: SafetyClass::ReadOnly,
+            calls,
+        }
+    }
+
+    fn side_effecting(calls: Arc<Mutex<Vec<serde_json::Value>>>) -> Self {
+        Self {
+            name: "delete_file",
+            class: SafetyClass::SideEffecting,
+            calls,
+        }
+    }
 }
 
 #[async_trait]
 impl Tool for RecordingTool {
     fn name(&self) -> &str {
-        "get_time"
+        self.name
     }
     fn description(&self) -> &str {
         "stub for tests"
@@ -143,7 +163,22 @@ impl Tool for RecordingTool {
     }
     fn cancel(&self) {}
     fn safety_class(&self) -> SafetyClass {
-        SafetyClass::ReadOnly
+        self.class
+    }
+}
+
+/// A [`Confirm`] recording every prompt it was asked, returning a fixed
+/// answer.
+struct FakeConfirm {
+    approve: bool,
+    prompts: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl marceline_core::Confirm for FakeConfirm {
+    async fn confirm(&self, prompt: &str) -> bool {
+        self.prompts.lock().unwrap().push(prompt.to_string());
+        self.approve
     }
 }
 
@@ -180,9 +215,7 @@ async fn a_tool_call_is_run_and_its_result_feeds_a_final_answer() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let mut broker = ToolBroker::new();
     broker
-        .register(Arc::new(RecordingTool {
-            calls: Arc::clone(&calls),
-        }))
+        .register(Arc::new(RecordingTool::get_time(Arc::clone(&calls))))
         .unwrap();
 
     let messages = vec![Message::new(Role::User, "what time is it")];
@@ -196,6 +229,7 @@ async fn a_tool_call_is_run_and_its_result_feeds_a_final_answer() {
         512,
         8,
         CancellationToken::new(),
+        &marceline_core::DeclineAll,
         |delta| seen_text.push_str(delta),
     )
     .await
@@ -229,9 +263,7 @@ async fn hitting_the_iteration_cap_forces_a_final_answer_without_running_the_too
     let calls = Arc::new(Mutex::new(Vec::new()));
     let mut broker = ToolBroker::new();
     broker
-        .register(Arc::new(RecordingTool {
-            calls: Arc::clone(&calls),
-        }))
+        .register(Arc::new(RecordingTool::get_time(Arc::clone(&calls))))
         .unwrap();
 
     let messages = vec![Message::new(Role::User, "what time is it")];
@@ -246,6 +278,7 @@ async fn hitting_the_iteration_cap_forces_a_final_answer_without_running_the_too
         512,
         0,
         CancellationToken::new(),
+        &marceline_core::DeclineAll,
         |_| {},
     )
     .await
@@ -282,6 +315,7 @@ async fn a_final_answer_with_no_tool_calls_is_a_single_round() {
         512,
         8,
         CancellationToken::new(),
+        &marceline_core::DeclineAll,
         |_| {},
     )
     .await
@@ -297,4 +331,130 @@ fn env_override_takes_precedence_over_configured_cap() {
     std::env::set_var(MAX_TOOL_ITERS_ENV, "2");
     assert_eq!(resolve_max_iterations(8), 2);
     std::env::remove_var(MAX_TOOL_ITERS_ENV);
+}
+
+/// The tool-call round: the model asks for the side-effecting
+/// `delete_file` stub.
+fn side_effecting_call_round() -> ScriptedResponse {
+    vec![
+        sse_line(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"delete_file","arguments":"{}"}}]},"finish_reason":null}]}"#,
+        ),
+        sse_line(r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#),
+    ]
+}
+
+#[tokio::test]
+async fn a_side_effecting_tool_is_confirmed_before_it_runs() {
+    let (base_url, _bodies) = start_scripted_server(vec![
+        side_effecting_call_round(),
+        final_round("Deleted it."),
+    ])
+    .await;
+    let config = test_config(base_url);
+    let engine = OpenAiCompatibleEngine::new(&config, CancellationToken::new()).expect("engine");
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut broker = ToolBroker::new();
+    broker.register(Arc::new(RecordingTool::side_effecting(Arc::clone(&calls)))).unwrap();
+
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let confirm = FakeConfirm {
+        approve: true,
+        prompts: Arc::clone(&prompts),
+    };
+
+    let messages = vec![Message::new(Role::User, "delete the file")];
+    let (outcome, _messages) = think(
+        &engine,
+        &broker,
+        messages,
+        broker.catalog(),
+        512,
+        8,
+        CancellationToken::new(),
+        &confirm,
+        |_| {},
+    )
+    .await
+    .expect("thinking loop succeeds");
+
+    assert_eq!(outcome.text, "Deleted it.");
+    assert_eq!(calls.lock().unwrap().len(), 1, "approved call must run");
+    assert_eq!(prompts.lock().unwrap().len(), 1, "must have asked exactly once");
+    assert!(prompts.lock().unwrap()[0].contains("delete_file"));
+}
+
+#[tokio::test]
+async fn declining_confirmation_skips_the_tool_and_feeds_a_declined_result_back() {
+    let (base_url, bodies) = start_scripted_server(vec![
+        side_effecting_call_round(),
+        final_round("Okay, I won't."),
+    ])
+    .await;
+    let config = test_config(base_url);
+    let engine = OpenAiCompatibleEngine::new(&config, CancellationToken::new()).expect("engine");
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut broker = ToolBroker::new();
+    broker.register(Arc::new(RecordingTool::side_effecting(Arc::clone(&calls)))).unwrap();
+
+    let confirm = FakeConfirm {
+        approve: false,
+        prompts: Arc::new(Mutex::new(Vec::new())),
+    };
+
+    let messages = vec![Message::new(Role::User, "delete the file")];
+    let (outcome, _messages) = think(
+        &engine,
+        &broker,
+        messages,
+        broker.catalog(),
+        512,
+        8,
+        CancellationToken::new(),
+        &confirm,
+        |_| {},
+    )
+    .await
+    .expect("thinking loop succeeds");
+
+    assert_eq!(outcome.text, "Okay, I won't.");
+    assert!(calls.lock().unwrap().is_empty(), "a declined call must never run");
+
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 2, "one tool-call round, one round with the declined result");
+    assert!(bodies[1].contains("declined"));
+}
+
+#[tokio::test]
+async fn with_no_side_effecting_tool_registered_the_loop_behaves_as_plain_read_only_auto_run() {
+    // The v1 default: DeclineAll is wired in everywhere, but since no
+    // tool above ReadOnly is ever registered, it is never actually
+    // consulted — this is the "Done when" case for the whole story.
+    let (base_url, _bodies) = start_scripted_server(vec![tool_call_round(), final_round("It is 12:00 PM.")]).await;
+    let config = test_config(base_url);
+    let engine = OpenAiCompatibleEngine::new(&config, CancellationToken::new()).expect("engine");
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut broker = ToolBroker::new();
+    broker.register(Arc::new(RecordingTool::get_time(Arc::clone(&calls)))).unwrap();
+
+    let messages = vec![Message::new(Role::User, "what time is it")];
+    let (outcome, _messages) = think(
+        &engine,
+        &broker,
+        messages,
+        broker.catalog(),
+        512,
+        8,
+        CancellationToken::new(),
+        &marceline_core::DeclineAll,
+        |_| {},
+    )
+    .await
+    .expect("thinking loop succeeds");
+
+    assert_eq!(outcome.text, "It is 12:00 PM.");
+    assert_eq!(calls.lock().unwrap().len(), 1, "read-only tools auto-run without confirmation");
 }

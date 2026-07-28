@@ -14,6 +14,12 @@
 //! side-effecting tool (EPIC 6.5) is a new impl, not a trait rewrite —
 //! but nothing dangerous is registered until the security pass (EPIC 14)
 //! signs off.
+//!
+//! The gating [`SafetyClass`] exists for — auto-run vs. require a spoken
+//! confirmation before dispatch — is enforced in
+//! [`crate::thinking::think`] (EPIC 6.5), not here: the broker only has to
+//! be able to report a registered tool's class
+//! ([`ToolBroker::safety_class`]) for that gate to consult.
 
 pub mod get_time;
 pub mod list_dir;
@@ -51,6 +57,12 @@ pub enum SafetyClass {
     /// the result back," not "undo it." Requires voice confirmation
     /// (EPIC 6.5) before it may run at all.
     SideEffecting,
+    /// Higher-stakes than [`SafetyClass::SideEffecting`] (e.g. destructive
+    /// or irreversible actions) — same confirmation gate in v1, but a
+    /// distinct class so SOUL.md tool policy (§3.2, EPIC 9.3) and the
+    /// security pass (EPIC 14.3) have something narrower than
+    /// `SideEffecting` to key stricter defaults on later.
+    Dangerous,
 }
 
 /// The outcome of one [`Tool::call`], fed back to the LLM as a `Tool`
@@ -170,6 +182,16 @@ impl ToolBroker {
         }
     }
 
+    /// The safety class `name` was registered with, or `None` if it is
+    /// not registered.
+    ///
+    /// This is what lets a caller (the THINKING loop, EPIC 6.3/6.5) gate
+    /// dispatch on class *before* calling [`Self::dispatch`] — checking
+    /// after the fact would be too late for a side-effecting tool.
+    pub fn safety_class(&self, name: &str) -> Option<SafetyClass> {
+        self.tools.get(name).map(|tool| tool.safety_class())
+    }
+
     /// Requests cancellation of `name`'s in-flight call, if it is
     /// registered. A name that is not registered is a no-op rather than
     /// an error: nothing to cancel is not a fault.
@@ -250,6 +272,15 @@ mod tests {
             catalog[0].parameters,
             serde_json::json!({"type": "object", "properties": {}})
         );
+    }
+
+    #[test]
+    fn safety_class_reports_a_registered_tools_class() {
+        let mut broker = ToolBroker::new();
+        broker.register(stub("get_time")).unwrap();
+
+        assert_eq!(broker.safety_class("get_time"), Some(SafetyClass::ReadOnly));
+        assert_eq!(broker.safety_class("nonexistent"), None);
     }
 
     #[test]
