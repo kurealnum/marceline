@@ -25,17 +25,21 @@ _sym_db = _symbol_database.Default()
 from . import common_pb2 as common__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\ttts.proto\x12\rmarceline.tts\x1a\x0c\x63ommon.proto\"S\n\nTtsRequest\x12\x0e\n\x04text\x18\x01 \x01(\tH\x00\x12*\n\x06\x63\x61ncel\x18\x02 \x01(\x0b\x32\x18.marceline.common.CancelH\x00\x42\t\n\x07payload\":\n\x0bTtsResponse\x12+\n\x05\x61udio\x18\x01 \x01(\x0b\x32\x1c.marceline.common.AudioChunk2N\n\x03Tts\x12G\n\nSynthesize\x12\x19.marceline.tts.TtsRequest\x1a\x1a.marceline.tts.TtsResponse(\x01\x30\x01\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\ttts.proto\x12\rmarceline.tts\x1a\x0c\x63ommon.proto\"\x10\n\x0eTtsInfoRequest\"C\n\x07TtsInfo\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x0e\n\x06voices\x18\x02 \x03(\t\x12\x1a\n\x12output_sample_rate\x18\x03 \x01(\r\"d\n\nTtsRequest\x12\x0e\n\x04text\x18\x01 \x01(\tH\x00\x12*\n\x06\x63\x61ncel\x18\x02 \x01(\x0b\x32\x18.marceline.common.CancelH\x00\x12\x0f\n\x05voice\x18\x03 \x01(\tH\x00\x42\t\n\x07payload\":\n\x0bTtsResponse\x12+\n\x05\x61udio\x18\x01 \x01(\x0b\x32\x1c.marceline.common.AudioChunk2\x90\x01\n\x03Tts\x12G\n\nSynthesize\x12\x19.marceline.tts.TtsRequest\x1a\x1a.marceline.tts.TtsResponse(\x01\x30\x01\x12@\n\x07GetInfo\x12\x1d.marceline.tts.TtsInfoRequest\x1a\x16.marceline.tts.TtsInfob\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'tts_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_TTSREQUEST']._serialized_start=42
-  _globals['_TTSREQUEST']._serialized_end=125
-  _globals['_TTSRESPONSE']._serialized_start=127
-  _globals['_TTSRESPONSE']._serialized_end=185
-  _globals['_TTS']._serialized_start=187
-  _globals['_TTS']._serialized_end=265
+  _globals['_TTSINFOREQUEST']._serialized_start=42
+  _globals['_TTSINFOREQUEST']._serialized_end=58
+  _globals['_TTSINFO']._serialized_start=60
+  _globals['_TTSINFO']._serialized_end=127
+  _globals['_TTSREQUEST']._serialized_start=129
+  _globals['_TTSREQUEST']._serialized_end=229
+  _globals['_TTSRESPONSE']._serialized_start=231
+  _globals['_TTSRESPONSE']._serialized_end=289
+  _globals['_TTS']._serialized_start=292
+  _globals['_TTS']._serialized_end=436
 # @@protoc_insertion_point(module_scope)

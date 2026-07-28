@@ -13,6 +13,25 @@ service Tts {
   // messages on the request stream to stop in-flight synthesis
   // cooperatively (§2.5.1).
   rpc Synthesize(stream TtsRequest) returns (stream TtsResponse);
+  // Reports the loaded backend's capabilities, so the Rust side can build
+  // its `TtsInfo` (§2.4) from what the worker actually loaded — voice ids
+  // and output sample rate — rather than from what config asked for.
+  rpc GetInfo(TtsInfoRequest) returns (TtsInfo);
+}
+
+// Empty request for `Tts.GetInfo`; a message (not `Empty`) so capability
+// filters can be added later without breaking the RPC signature.
+message TtsInfoRequest {}
+
+// Capabilities of the backend this worker actually loaded.
+message TtsInfo {
+  // Backend/model name, e.g. "kokoro:af_sky".
+  string name = 1;
+  // Voice ids this backend can synthesize (Kokoro's fixed voice set).
+  repeated string voices = 2;
+  // Sample rate (Hz) the backend actually emits. Declared here rather than
+  // assumed, so a consumer never guesses it (§2.4.1's chipmunk warning).
+  uint32 output_sample_rate = 3;
 }
 
 // One message on the client-to-server request stream.
@@ -22,6 +41,10 @@ message TtsRequest {
     string text = 1;
     // Cooperative cancel signal; worker returns early between decode steps.
     marceline.common.Cancel cancel = 2;
+    // Voice id to synthesize with, e.g. "af_sky" (§3.1's `[tts].voice`).
+    // Sent at most once, before any `text`; a stream that never sends one
+    // uses the worker's configured default voice.
+    string voice = 3;
   }
 }
 
