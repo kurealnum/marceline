@@ -29,10 +29,6 @@ from piper import PiperVoice
 
 log = logging.getLogger("marceline.tts.piper")
 
-# int16 PCM's full-scale magnitude, for normalizing Piper's raw output to
-# the f32 range every other backend and the wire contract use.
-_INT16_FULL_SCALE = 32_768.0
-
 # Directory holding downloaded `.onnx` (+ `.onnx.json`) voice models,
 # alongside this file. Keeps voice resolution a filename lookup rather
 # than requiring a full path in `[tts].voice`.
@@ -130,9 +126,9 @@ class PiperBackend:
                 has the one it loaded; a mismatch is logged and ignored
                 rather than failing the turn, since the fixed-voice-per-
                 worker model makes a mid-stream swap meaningless.
-            cancel: Checked between raw audio frames; when set, generation
-                stops early rather than burning compute on audio nobody
-                will hear (§2.5.1).
+            cancel: Checked between per-sentence audio chunks; when set,
+                generation stops early rather than burning compute on
+                audio nobody will hear (§2.5.1).
 
         Yields:
             Mono f32 PCM arrays at [`sample_rate`][PiperBackend.sample_rate].
@@ -148,9 +144,12 @@ class PiperBackend:
         if cancel.is_set():
             return
 
-        for raw_frame in self._voice.synthesize_stream_raw(text):
+        # `PiperVoice.synthesize` yields one already-f32, already-
+        # normalized `AudioChunk` per sentence it detects in `text` (Piper
+        # does its own clause splitting inside a span); each is handed
+        # onward as soon as it is ready rather than concatenated.
+        for chunk in self._voice.synthesize(text):
             if cancel.is_set():
-                log.info("cancel observed between audio frames, stopping synthesis")
+                log.info("cancel observed between audio chunks, stopping synthesis")
                 return
-            pcm_i16 = np.frombuffer(raw_frame, dtype=np.int16)
-            yield (pcm_i16.astype(np.float32) / _INT16_FULL_SCALE)
+            yield chunk.audio_float_array

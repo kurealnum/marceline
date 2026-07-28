@@ -7,5 +7,11 @@ protobuf>=5.26.1,<6.0dev
 # --- model-specific ---
 # numpy is also all the servicer's own tests need; piper is only pulled in
 # by piper_backend.py, which worker.py imports lazily.
+#
+# 1.2.0 and earlier depend on `piper-phonemize`, which never shipped a
+# cp312+ wheel and is unmaintained; 1.3.0 is the piper1-gpl rewrite that
+# dropped it in favor of onnxruntime + bundled espeak-ng data, and changed
+# `synthesize_stream_raw()` (raw int16 bytes) to `synthesize()` (f32
+# `AudioChunk`s) — see `piper_backend.py`.
 numpy>=1.26,<3
-piper-tts==1.2.0
+piper-tts==1.3.0

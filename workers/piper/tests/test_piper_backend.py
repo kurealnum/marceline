@@ -8,9 +8,8 @@ service.
 
 `piper` itself is stubbed into `sys.modules`, so these run without
 onnxruntime or model weights installed. That means they check the glue
-this file actually owns (raw-frame consumption, cancel between frames,
-int16-to-f32 normalization, sample-rate passthrough) rather than
-re-testing the library.
+this file actually owns (per-sentence chunk consumption, cancel between
+chunks, sample-rate passthrough) rather than re-testing the library.
 
 Run from this worker's directory:
 
@@ -24,10 +23,18 @@ import sys
 import threading
 import types
 import unittest
+from dataclasses import dataclass
 
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+@dataclass
+class FakeAudioChunk:
+    """Stands in for `piper.voice.AudioChunk`."""
+
+    audio_float_array: np.ndarray
 
 
 class FakeConfig:
@@ -38,8 +45,8 @@ class FakeConfig:
 class FakePiperVoice:
     """Scriptable stand-in for `piper.PiperVoice`.
 
-    Yields its raw int16 frames lazily, like the real thing, so a test can
-    observe what happens when cancel fires partway through generation.
+    Yields its per-sentence chunks lazily, like the real thing, so a test
+    can observe what happens when cancel fires partway through generation.
     """
 
     #: Constructor args of the most recently loaded voice.
@@ -47,12 +54,12 @@ class FakePiperVoice:
 
     def __init__(self, sample_rate: int = 22_050) -> None:
         self.config = FakeConfig(sample_rate)
-        self.frames: list[list[int]] = []
+        self.chunks: list[list[float]] = []
         #: Set by a test to fire mid-iteration, emulating a cancel arriving
-        #: while the generator is still producing frames.
+        #: while the generator is still producing chunks.
         self.cancel_after: int | None = None
         self.cancel_event: threading.Event | None = None
-        #: How many frames the generator actually produced.
+        #: How many chunks the generator actually produced.
         self.yielded = 0
         self.last_text: str | None = None
 
@@ -61,11 +68,11 @@ class FakePiperVoice:
         FakePiperVoice.last_load = {"model_path": model_path, "use_cuda": use_cuda}
         return cls()
 
-    def synthesize_stream_raw(self, text):
+    def synthesize(self, text):
         self.last_text = text
 
         def generate():
-            for index, samples in enumerate(self.frames):
+            for index, samples in enumerate(self.chunks):
                 if (
                     self.cancel_after is not None
                     and self.cancel_event is not None
@@ -73,7 +80,7 @@ class FakePiperVoice:
                 ):
                     self.cancel_event.set()
                 self.yielded += 1
-                yield np.array(samples, dtype=np.int16).tobytes()
+                yield FakeAudioChunk(np.array(samples, dtype=np.float32))
 
         return generate()
 
@@ -119,26 +126,26 @@ class PiperBackendTest(unittest.TestCase):
 
         self.assertEqual(backend.sample_rate, 16_000)
 
-    def test_synthesize_yields_normalized_f32_per_frame(self) -> None:
+    def test_synthesize_yields_each_chunks_float_array(self) -> None:
         backend = self.mod.PiperBackend("/models/voice.onnx", "voice-id", "cpu")
         backend.load()
         fake_voice = backend._voice
-        fake_voice.frames = [[16_384, -16_384], [0, 32_767]]
+        fake_voice.chunks = [[0.5, -0.5], [0.0, 0.999969]]
 
         chunks = list(backend.synthesize("hi there", "voice-id", threading.Event()))
 
         self.assertEqual(len(chunks), 2)
-        self.assertTrue(np.allclose(chunks[0], [0.5, -0.5], atol=1e-4))
-        self.assertTrue(np.allclose(chunks[1], [0.0, 0.999969], atol=1e-4))
+        self.assertTrue(np.allclose(chunks[0], [0.5, -0.5]))
+        self.assertTrue(np.allclose(chunks[1], [0.0, 0.999969]))
         for chunk in chunks:
             self.assertEqual(chunk.dtype, np.float32)
         self.assertEqual(fake_voice.last_text, "hi there")
 
-    def test_cancel_between_frames_stops_generation_early(self) -> None:
+    def test_cancel_between_chunks_stops_generation_early(self) -> None:
         backend = self.mod.PiperBackend("/models/voice.onnx", "voice-id", "cpu")
         backend.load()
         fake_voice = backend._voice
-        fake_voice.frames = [[100], [200], [300]]
+        fake_voice.chunks = [[0.1], [0.2], [0.3]]
 
         cancel = threading.Event()
         fake_voice.cancel_after = 1
@@ -146,7 +153,7 @@ class PiperBackendTest(unittest.TestCase):
 
         chunks = list(backend.synthesize("a long sentence", "voice-id", cancel))
 
-        # The cancel fires as frame index 1 starts; only the first
+        # The cancel fires as chunk index 1 starts; only the first
         # (already-yielded) chunk should reach the caller.
         self.assertEqual(len(chunks), 1)
 
@@ -158,7 +165,7 @@ class PiperBackendTest(unittest.TestCase):
     def test_mismatched_voice_is_ignored_rather_than_failing(self) -> None:
         backend = self.mod.PiperBackend("/models/voice.onnx", "voice-id", "cpu")
         backend.load()
-        backend._voice.frames = [[100]]
+        backend._voice.chunks = [[0.1]]
 
         # Must not raise even though "other-voice" != "voice-id".
         chunks = list(backend.synthesize("hi", "other-voice", threading.Event()))
