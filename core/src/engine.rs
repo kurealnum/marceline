@@ -78,6 +78,21 @@ pub enum EngineError {
         /// Backend whose stream was cancelled, e.g. `"stt"`.
         backend: &'static str,
     },
+    /// A configured cost/rate guardrail (§4.5) refused the request before it
+    /// ever reached the backend.
+    ///
+    /// Distinct from every other variant: those describe the backend
+    /// failing partway through, this describes the backend never being
+    /// called at all. Callers route this to a graceful spoken message
+    /// (§2.5's ERROR edge), same as any other refusal, not a retry — the
+    /// whole point of the cap is to stop spending, not to keep trying.
+    #[error("{backend} refused: {message}")]
+    GuardrailRefused {
+        /// Backend the guardrail is protecting, e.g. `"llm"`.
+        backend: &'static str,
+        /// Which cap was hit and its configured value.
+        message: String,
+    },
 }
 
 impl EngineError {
@@ -87,6 +102,16 @@ impl EngineError {
     /// user: the user interrupting is not something to apologize for.
     pub fn is_cancelled(&self) -> bool {
         matches!(self, EngineError::Cancelled { .. })
+    }
+
+    /// True when a cost/rate guardrail (§4.5) refused the request, rather
+    /// than the backend failing.
+    ///
+    /// Callers use this to route to a graceful "I can't do that right now"
+    /// message instead of an apology for a fault — refusing on purpose is
+    /// not the same failure as the backend breaking.
+    pub fn is_guardrail_refused(&self) -> bool {
+        matches!(self, EngineError::GuardrailRefused { .. })
     }
 }
 

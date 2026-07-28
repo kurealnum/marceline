@@ -12,6 +12,7 @@
 //! malformed chunk propagates in-band instead of silently truncating a
 //! stream that looks like it ended normally.
 
+pub mod guard;
 pub mod openai;
 pub mod prompt;
 pub mod turns;
@@ -23,6 +24,7 @@ use futures::Stream;
 
 use crate::engine::EngineError;
 
+pub use guard::SessionGuard;
 pub use openai::OpenAiCompatibleEngine;
 pub use prompt::{compile_system_prompt, MemoryEntry, Trust};
 pub use turns::{DropOldestTurn, TrimPolicy, TurnBuffer};

@@ -140,6 +140,14 @@ async fn run_say_to_llm(args: &[String]) -> ExitCode {
 
     match say_to_llm::say_to_llm(&config_path, &soul_path, text).await {
         Ok(()) => ExitCode::SUCCESS,
+        Err(say_to_llm::SayToLlmError::Engine(err)) if err.is_guardrail_refused() => {
+            // The graceful spoken message this refusal maps to on the
+            // ERROR edge (§2.5, §9.11) once an orchestrator exists to
+            // speak it; on the command line the equivalent is a plain,
+            // non-panicked message rather than a raw error dump.
+            println!("I can't do that right now — {err}");
+            ExitCode::FAILURE
+        }
         Err(err) => {
             eprintln!("say-to-llm failed: {err}");
             ExitCode::FAILURE
