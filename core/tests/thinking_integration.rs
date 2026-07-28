@@ -458,3 +458,100 @@ async fn with_no_side_effecting_tool_registered_the_loop_behaves_as_plain_read_o
     assert_eq!(outcome.text, "It is 12:00 PM.");
     assert_eq!(calls.lock().unwrap().len(), 1, "read-only tools auto-run without confirmation");
 }
+
+/// A stub tool that never finishes on its own — the only way its `call`
+/// returns is the per-call `cancel` token firing, exactly like the real
+/// `web_search`/`read_file`/`list_dir`/MCP tools racing their own work
+/// against it (EPIC 6.2/6.4).
+struct SlowTool {
+    observed_cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl Tool for SlowTool {
+    fn name(&self) -> &str {
+        "slow_tool"
+    }
+    fn description(&self) -> &str {
+        "stub for tests"
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+    async fn call(&self, _args: serde_json::Value, cancel: CancellationToken) -> ToolResult {
+        cancel.cancelled().await;
+        self.observed_cancel.store(true, Ordering::SeqCst);
+        ToolResult::Err("cancelled".to_string())
+    }
+    fn cancel(&self) {}
+    fn safety_class(&self) -> SafetyClass {
+        SafetyClass::ReadOnly
+    }
+}
+
+/// The tool-call round: the model asks for the never-finishing stub.
+fn slow_tool_call_round() -> ScriptedResponse {
+    vec![
+        sse_line(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"slow_tool","arguments":"{}"}}]},"finish_reason":null}]}"#,
+        ),
+        sse_line(r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#),
+    ]
+}
+
+#[tokio::test]
+async fn firing_the_run_token_mid_tool_call_aborts_it_and_discards_the_result() {
+    // Only one scripted response: if the loop wrongly tried a second
+    // round trip after cancellation, the server would serve this same
+    // response again (clamped), which the assertions below would catch
+    // via the request count.
+    let (base_url, bodies) = start_scripted_server(vec![slow_tool_call_round()]).await;
+    let config = test_config(base_url);
+    let cancel = CancellationToken::new();
+    let engine = OpenAiCompatibleEngine::new(&config, cancel.clone()).expect("engine");
+
+    let observed_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut broker = ToolBroker::new();
+    broker
+        .register(Arc::new(SlowTool {
+            observed_cancel: Arc::clone(&observed_cancel),
+        }))
+        .unwrap();
+
+    let messages = vec![Message::new(Role::User, "do the slow thing")];
+
+    let cancel_for_task = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        cancel_for_task.cancel();
+    });
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        think(
+            &engine,
+            &broker,
+            messages,
+            broker.catalog(),
+            512,
+            8,
+            cancel,
+            &marceline_core::DeclineAll,
+            |_| {},
+        ),
+    )
+    .await
+    .expect("think() must return promptly after cancel, not hang");
+
+    let err = result.expect_err("a cancelled run must not produce a normal outcome");
+    assert!(err.is_cancelled(), "got {err:?}");
+    assert!(
+        observed_cancel.load(Ordering::SeqCst),
+        "the tool's own call() must have actually observed the cancel token"
+    );
+    assert_eq!(
+        bodies.lock().unwrap().len(),
+        1,
+        "a cancelled tool result must never be fed back into a second chat request"
+    );
+}
