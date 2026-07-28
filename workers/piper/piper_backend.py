@@ -9,7 +9,7 @@ model, light enough to run on CPU where Kokoro is not viable.
 
 Unlike Kokoro's fixed voice set selectable per request, a Piper worker
 loads exactly one voice model at startup — swapping voices is a worker
-restart with a different `--voice`, the same "hot-swappable via a config
+restart with a different `--model-id`, the same "hot-swappable via a config
 line" pattern the STT workers use for models (§2.4).
 
 `piper`/`onnxruntime` are imported at module import time, so `worker.py`

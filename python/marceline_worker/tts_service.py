@@ -195,7 +195,13 @@ class TtsServicer(tts_pb2_grpc.TtsServicer):
 
 
 def parse_args(argv: list[str], description: str) -> argparse.Namespace:
-    """Parses the standard worker CLI plus the TTS-specific `--voice`."""
+    """Parses the standard worker CLI, per the template's
+    `--socket-path`/`--model-id`/`--device` convention (EPIC 0.4) — the
+    same convention `WorkerSpec::command` in the Rust supervisor always
+    launches a worker with. `--model-id` carries the default voice id
+    here; `dest="voice"` keeps the rest of this module reading `args.voice`
+    rather than the wire-flag name.
+    """
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument(
         "--socket-path",
@@ -203,7 +209,8 @@ def parse_args(argv: list[str], description: str) -> argparse.Namespace:
         help="Filesystem path of the unix domain socket to bind and listen on.",
     )
     parser.add_argument(
-        "--voice",
+        "--model-id",
+        dest="voice",
         required=True,
         help="Default voice id to synthesize with, e.g. 'af_sky'.",
     )

@@ -32,4 +32,4 @@ echo "${REPO_ROOT}/python" > "${SITE_PACKAGES}/marceline.pth"
 
 echo "TTS worker venv ready at ${VENV_DIR}"
 echo "Run: ${VENV_DIR}/bin/python ${ROOT}/worker.py \\"
-echo "       --socket-path /tmp/marceline-tts.sock --voice af_sky --device cpu"
+echo "       --socket-path /tmp/marceline-tts.sock --model-id af_sky --device cpu"
