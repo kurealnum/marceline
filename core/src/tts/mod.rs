@@ -13,6 +13,7 @@
 
 pub mod chunker;
 pub mod grpc;
+pub mod playback;
 
 use std::pin::Pin;
 
@@ -23,6 +24,7 @@ use crate::engine::{AudioStream, EngineError};
 
 pub use chunker::sentence_chunk;
 pub use grpc::GrpcTtsEngine;
+pub use playback::{play, PlaybackSink};
 
 /// Already-segmented text streamed into a [`TtsEngine`] (SPEC.md §2.4.1).
 ///

@@ -36,6 +36,8 @@ pub use stt::{
 };
 pub use supervisor::{HealthView, Supervisor, WorkerSpec, WorkerState};
 pub use transcribe::{transcribe_segment, Transcription};
-pub use tts::{sentence_chunk, GrpcTtsEngine, TextStream, TtsEngine, TtsInfo, VoiceId};
+pub use tts::{
+    play, sentence_chunk, GrpcTtsEngine, PlaybackSink, TextStream, TtsEngine, TtsInfo, VoiceId,
+};
 pub use vad::{SileroVad, VadEndpointer, VadError, DEFAULT_SPEECH_THRESHOLD, FRAME_SAMPLES};
 pub use wake::{EnergyWakeDetector, WakeDetector, WakeEngine, WakeEvent};
