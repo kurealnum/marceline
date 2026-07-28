@@ -13,6 +13,7 @@
 //! stream that looks like it ended normally.
 
 pub mod openai;
+pub mod prompt;
 
 use std::pin::Pin;
 
@@ -22,6 +23,7 @@ use futures::Stream;
 use crate::engine::EngineError;
 
 pub use openai::OpenAiCompatibleEngine;
+pub use prompt::{compile_system_prompt, MemoryEntry, Trust};
 
 /// One entry in a chat conversation sent to the backend.
 #[derive(Debug, Clone, PartialEq)]
