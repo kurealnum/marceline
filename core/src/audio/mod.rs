@@ -8,12 +8,14 @@ pub mod meter;
 pub mod playback;
 pub mod resample;
 pub mod ring;
+pub mod wav_read;
 pub mod wav_tap;
 
 pub use capture::{Capture, CaptureError};
 pub use meter::LevelMeter;
 pub use playback::{Playback, PlaybackError};
 pub use ring::PreRollRing;
+pub use wav_read::{read_wav, WavReadError};
 pub use wav_tap::{WavTap, WavTapError};
 
 /// Self-describing PCM audio chunk (SPEC.md §2.4.1 invariant 2): sample

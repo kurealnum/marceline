@@ -8,17 +8,31 @@ name = "marceline_core"
 path = "src/lib.rs"
 
 [dependencies]
+protocol = { path = "../protocol" }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+# Comment- and layout-preserving TOML, for writing single values back to
+# a config file a human wrote (config_edit.rs).
+toml_edit = "0.22"
 thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["process", "rt-multi-thread", "macros", "sync", "time", "net"] }
 tonic = "0.12"
 tonic-health = "0.12"
+
+async-trait = "0.1"
+futures = "0.3"
+tokio-util = "0.7"
 tower = "0.4"
 hyper-util = { version = "0.1", features = ["tokio"] }
 cpal = "0.15"
 crossbeam-channel = "0.5"
 hound = "3"
 ort = { version = "2.0.0-rc.12", features = ["download-binaries"] }
+
+[dev-dependencies]
+# The STT client tests run a fake `Stt` server over a real unix socket,
+# which needs the generated server stubs and stream adapters for a
+# `UnixListener` / `mpsc` receiver.
+tokio-stream = { version = "0.1", features = ["net"] }
