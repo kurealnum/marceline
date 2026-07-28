@@ -37,6 +37,71 @@ pub struct Message {
     /// Message text. Empty for an assistant message that only carries tool
     /// calls.
     pub content: String,
+    /// Present only on a [`Role::Assistant`] message that made tool
+    /// calls — the exact calls the model requested, replayed so the
+    /// follow-up request round-trips id/name/arguments the way
+    /// OpenAI-compatible backends require (§2.5.1, §4, EPIC 6.3). Empty
+    /// on every other message.
+    pub tool_calls: Vec<ToolCallRequest>,
+    /// Present only on a [`Role::Tool`] message: the id of the assistant
+    /// `tool_calls` entry this result answers, linking the two the way
+    /// the wire protocol expects. `None` on every other message.
+    pub tool_call_id: Option<String>,
+}
+
+impl Message {
+    /// A plain message with no tool-call linkage — every role except a
+    /// tool result or a tool-calling assistant turn.
+    pub fn new(role: Role, content: impl Into<String>) -> Self {
+        Self {
+            role,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
+    }
+
+    /// An assistant turn that requested `tool_calls` (EPIC 6.3). `content`
+    /// is usually empty — a model requesting tools rarely also emits text
+    /// in the same turn, but it is not assumed here.
+    pub fn assistant_tool_calls(content: impl Into<String>, tool_calls: Vec<ToolCallRequest>) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+            tool_calls,
+            tool_call_id: None,
+        }
+    }
+
+    /// A tool result answering the assistant `tool_calls` entry `id`
+    /// (EPIC 6.3).
+    pub fn tool_result(id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: Role::Tool,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(id.into()),
+        }
+    }
+}
+
+/// One tool call the model requested, as replayed on the assistant
+/// [`Message`] that made it (SPEC.md §2.5.1, EPIC 6.3).
+///
+/// Assembled by accumulating [`ChatEvent::ToolCallDelta`] fragments for one
+/// `id` until [`ChatEvent::ToolCallDone`] — mirrors how the wire protocol
+/// itself streams a tool call in pieces.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ToolCallRequest {
+    /// Identifies this call; a later `Role::Tool` message's
+    /// `tool_call_id` must match this to answer it.
+    pub id: String,
+    /// The tool's name.
+    pub name: String,
+    /// Raw JSON string of the call's arguments, as the model streamed
+    /// them — parsed by the dispatcher (EPIC 6.3), not here, so this type
+    /// stays backend-agnostic.
+    pub arguments: String,
 }
 
 /// Role of a [`Message`] in a chat conversation.

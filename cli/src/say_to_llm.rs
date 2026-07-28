@@ -1,18 +1,21 @@
-//! The `marceline say-to-llm <text>` path (EPIC 4.1, 4.2).
+//! The `marceline say-to-llm <text>` path (EPIC 4.1, 4.2, 6.3).
 //!
 //! Demoable proof that swapping LLM providers is a config change: run this
 //! against `[llm]` pointed at LM Studio, edit `base_url` / `model` /
 //! `api_key_env`, rerun unchanged, and it streams against the new backend.
 //! Also the first place a compiled system prompt (SOUL.md + memory, §3.2)
-//! actually reaches an LLM request.
+//! actually reaches an LLM request, and — since EPIC 6.3 — the first place
+//! the THINKING tool-call loop runs for real: ask "what time is it" and the
+//! model can actually get an answer via `get_time` (§7's demoable).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use futures::StreamExt;
 use marceline_core::{
-    compile_system_prompt, ChatEvent, ChatRequest, Config, LlmEngine, OpenAiCompatibleEngine,
-    SessionGuard, TurnBuffer,
+    compile_system_prompt, resolve_max_iterations, think, Config, GetTimeTool, LlmEngine,
+    ListDirTool, OpenAiCompatibleEngine, ReadFileTool, SessionGuard, ToolBroker, TurnBuffer,
+    WebSearchTool,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -44,7 +47,7 @@ pub async fn say_to_llm(
     let system_prompt = compile_system_prompt(&soul, &[]);
 
     let cancel = CancellationToken::new();
-    let engine = OpenAiCompatibleEngine::new(&config.llm, cancel)?;
+    let engine = OpenAiCompatibleEngine::new(&config.llm, cancel.clone())?;
     // Cost/rate guardrail (§4.5): caps this run to the configured
     // per-turn token budget and per-session request count, refusing
     // rather than calling the backend once either is exhausted.
@@ -55,6 +58,17 @@ pub async fn say_to_llm(
     );
     let info = engine.info();
 
+    // v1 built-ins only (EPIC 6.2) — read-only, per the epic's key
+    // constraint. MCP tools (EPIC 6.4) merge into the same broker later
+    // without this call site changing.
+    let mut broker = ToolBroker::new();
+    broker.register(Arc::new(GetTimeTool)).expect("get_time is the first registration");
+    broker.register(Arc::new(ReadFileTool)).expect("read_file is the first registration");
+    broker.register(Arc::new(ListDirTool)).expect("list_dir is the first registration");
+    broker
+        .register(Arc::new(WebSearchTool::new()?))
+        .expect("web_search is the first registration");
+
     // One-shot CLI run: a single turn, but routed through `TurnBuffer` so
     // the context-window trimming this session would eventually need is
     // exercised the same way the daemon's multi-turn conversations are.
@@ -62,34 +76,29 @@ pub async fn say_to_llm(
     turns.push_user(text);
     let messages = turns.messages_for_request(&system_prompt, info.context_window);
 
-    let request = ChatRequest {
-        messages,
-        tools: vec![],
-        max_tokens: config.llm.max_tokens_per_turn,
-    };
-
-    let mut stream = engine.chat(request).await;
     let mut stdout = std::io::stdout();
-    let mut reply = String::new();
+    let max_iterations = resolve_max_iterations(config.llm.max_tool_iterations_per_turn);
 
-    while let Some(event) = stream.next().await {
-        match event? {
-            ChatEvent::TextDelta(delta) => {
-                let _ = stdout.write_all(delta.as_bytes());
-                let _ = stdout.flush();
-                reply.push_str(&delta);
-            }
-            ChatEvent::ToolCallDelta { .. } | ChatEvent::ToolCallDone { .. } => {
-                // No tool broker wired up to `say-to-llm` yet (EPIC 6); the
-                // event still has to be drained rather than left unhandled,
-                // since dropping the stream mid-tool-call would look like a
-                // truncated response.
-            }
-            ChatEvent::Done { .. } => break,
-        }
-    }
+    let (outcome, _messages) = think(
+        &engine,
+        &broker,
+        messages,
+        broker.catalog(),
+        config.llm.max_tokens_per_turn,
+        max_iterations,
+        cancel,
+        |delta| {
+            let _ = stdout.write_all(delta.as_bytes());
+            let _ = stdout.flush();
+        },
+    )
+    .await?;
     println!();
-    turns.push_assistant(reply);
+
+    if outcome.iteration_cap_hit {
+        tracing::warn!(max_iterations, "tool iteration cap hit; forced a final answer");
+    }
+    turns.push_assistant(outcome.text);
 
     Ok(())
 }
