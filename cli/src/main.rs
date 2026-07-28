@@ -9,6 +9,7 @@ use std::sync::Arc;
 use marceline_core::{Device, HealthView, Supervisor, WorkerSpec};
 use tokio::sync::{watch, RwLock};
 
+mod say;
 mod say_to_llm;
 mod transcribe;
 
@@ -37,6 +38,7 @@ fn main() -> ExitCode {
 
     match args.get(1).map(String::as_str) {
         Some("transcribe") => runtime.block_on(run_transcribe(&args)),
+        Some("say") => runtime.block_on(run_say(&args)),
         Some("say-to-llm") => runtime.block_on(run_say_to_llm(&args)),
         Some("config") => run_config(&args),
         Some("--help") | Some("-h") => {
@@ -64,6 +66,7 @@ fn print_usage() {
 Usage:
   marceline                            Run the daemon
   marceline transcribe <file.wav>      Transcribe a wav file and print the text
+  marceline say <text>                 Speak text aloud, per [tts] config
   marceline say-to-llm <text>          Stream an LLM reply to text, per [llm] config
   marceline config get <key>           Print a config value
   marceline config set <key> <value>   Change a config value
@@ -74,11 +77,13 @@ Settable keys: {keys}
 Options:
   --config <path>   Config file (default {DEFAULT_CONFIG})
   --soul <path>     SOUL.md path for say-to-llm (default {soul_default})
+  --wav <path>      Wav output path for say (default {wav_default})
   --socket <path>   Attach to an already-running STT worker instead of
                     launching one from config (e.g. /tmp/marceline-stt.sock)
   --verbose         Debug-level logging",
         keys = SETTABLE_KEYS.join(", "),
         soul_default = say_to_llm::DEFAULT_SOUL,
+        wav_default = say::DEFAULT_WAV,
     );
 }
 
@@ -117,6 +122,34 @@ async fn run_transcribe(args: &[String]) -> ExitCode {
         }
         Err(err) => {
             eprintln!("transcription failed: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Runs `marceline say <text>` (EPIC 5, demoable).
+///
+/// Launches the TTS worker described by `[tts]` config, speaks `text`
+/// through it, and writes what it spoke to `--wav` — the epic's demoable:
+/// swap `[tts].backend` from `kokoro` to `piper` and rerun the same text.
+async fn run_say(args: &[String]) -> ExitCode {
+    let Some(text) = args.get(2).filter(|arg| !arg.starts_with('-')) else {
+        eprintln!("say requires text to speak");
+        print_usage();
+        return ExitCode::FAILURE;
+    };
+
+    let config_path =
+        PathBuf::from(flag_value(args, "--config").unwrap_or_else(|| DEFAULT_CONFIG.to_string()));
+    let wav_path = say::wav_path_from_args(args);
+
+    match say::say(&config_path, &wav_path, text).await {
+        Ok(()) => {
+            println!("wrote {}", wav_path.display());
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("say failed: {err}");
             ExitCode::FAILURE
         }
     }
