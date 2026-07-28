@@ -15,12 +15,22 @@
 //! but nothing dangerous is registered until the security pass (EPIC 14)
 //! signs off.
 
+pub mod get_time;
+pub mod list_dir;
+pub mod read_file;
+pub mod web_search;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
+
+pub use get_time::GetTimeTool;
+pub use list_dir::ListDirTool;
+pub use read_file::ReadFileTool;
+pub use web_search::WebSearchTool;
 
 use crate::llm::ToolSpec;
 
