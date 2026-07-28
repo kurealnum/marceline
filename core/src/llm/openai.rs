@@ -307,12 +307,20 @@ fn close_current_tool_call(current_tool_call: &mut Option<(u32, String)>, pendin
     }
 }
 
-/// Maps an OpenAI-reported `finish_reason` string to [`FinishReason`].
+/// Maps a backend-reported `finish_reason` string to [`FinishReason`].
+///
+/// Strict OpenAI only sends `stop` / `length` / `tool_calls` /
+/// `function_call`, but EPIC 4.4 (verifying LM Studio and a hosted provider
+/// by config swap only) found "OpenAI-compatible" backends are not all
+/// literal about it: `max_tokens` and `end_turn` are an Anthropic-style
+/// proxy's spellings of the same two outcomes. Recognizing them here, in
+/// the one place that maps wire strings to [`FinishReason`], is what keeps
+/// that variance from leaking into call sites as a provider-specific branch.
 fn finish_reason_from_wire(raw: &str) -> FinishReason {
     match raw {
-        "stop" => FinishReason::Stop,
-        "length" => FinishReason::Length,
-        "tool_calls" | "function_call" => FinishReason::ToolCalls,
+        "stop" | "end_turn" | "eos" => FinishReason::Stop,
+        "length" | "max_tokens" => FinishReason::Length,
+        "tool_calls" | "function_call" | "tool_use" => FinishReason::ToolCalls,
         _ => FinishReason::Other,
     }
 }
