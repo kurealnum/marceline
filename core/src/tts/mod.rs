@@ -11,6 +11,7 @@
 //! a Kokoro-vs-Piper difference in preferred chunk granularity never leaks
 //! into the caller.
 
+pub mod chunker;
 pub mod grpc;
 
 use std::pin::Pin;
@@ -20,6 +21,7 @@ use futures::Stream;
 
 use crate::engine::{AudioStream, EngineError};
 
+pub use chunker::sentence_chunk;
 pub use grpc::GrpcTtsEngine;
 
 /// Already-segmented text streamed into a [`TtsEngine`] (SPEC.md §2.4.1).
