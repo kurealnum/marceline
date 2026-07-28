@@ -41,7 +41,7 @@ Creates `.venv` and drops a `.pth` pointing at `python/` so the generated
 
 ```
 .venv/bin/python worker.py --socket-path /tmp/marceline-tts.sock \
-  --voice af_sky --device cpu
+  --model-id af_sky --device cpu
 ```
 
 Normally you don't run this by hand — `marceline say` launches it from
@@ -66,7 +66,7 @@ The contract tests are shared by every TTS backend:
 
 - **Voice from the request or config.** A request stream may send a
   `voice` message before any `text`; a stream that never sends one uses
-  the worker's configured default (`--voice`).
+  the worker's configured default (`--model-id`).
 - **Multiple chunks per span.** Kokoro splits a text span into its own
   sub-utterances internally; each is streamed back as an `AudioChunk` as
   soon as it is ready, rather than concatenated, so playback can start

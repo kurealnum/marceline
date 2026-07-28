@@ -28,7 +28,7 @@ tests need neither `piper` nor `onnxruntime`.
 
 Unlike Kokoro's fixed voice set selectable per request, a Piper worker
 loads exactly **one** voice model at startup. Switching voices is a
-worker restart with a different `--voice`, mirroring how the STT workers
+worker restart with a different `--model-id`, mirroring how the STT workers
 swap models (§2.4) — not a mid-stream selection. A request that names a
 different voice is honored with a logged warning and synthesized in the
 loaded voice anyway, rather than failing the turn.
@@ -47,10 +47,10 @@ into `voices/` as `<name>.onnx` + `<name>.onnx.json`.
 
 ```
 .venv/bin/python worker.py --socket-path /tmp/marceline-tts.sock \
-  --voice en_US-lessac-medium --device cpu
+  --model-id en_US-lessac-medium --device cpu
 ```
 
-`--voice` is either a short name resolved against `voices/<name>.onnx`, or
+`--model-id` is either a short name resolved against `voices/<name>.onnx`, or
 a full filesystem path to a `.onnx` model elsewhere.
 
 Normally you don't run this by hand — `marceline say` launches it from
