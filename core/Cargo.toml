@@ -30,9 +30,16 @@ cpal = "0.15"
 crossbeam-channel = "0.5"
 hound = "3"
 ort = { version = "2.0.0-rc.12", features = ["download-binaries"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde_json = "1"
+bytes = "1"
 
 [dev-dependencies]
 # The STT client tests run a fake `Stt` server over a real unix socket,
 # which needs the generated server stubs and stream adapters for a
 # `UnixListener` / `mpsc` receiver.
 tokio-stream = { version = "0.1", features = ["net"] }
+# The LLM client tests stub a local OpenAI-compatible HTTP endpoint.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
