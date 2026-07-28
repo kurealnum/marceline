@@ -157,6 +157,47 @@ pub struct EgressConfig {
     pub log: bool,
 }
 
+/// One configured MCP server (`[[mcp]]`, SPEC.md §2.3, §4, EPIC 6.4).
+///
+/// The Rust core is an MCP *client*; each entry here is one server whose
+/// tools join the broker's catalog, namespaced `name.toolName` so two
+/// servers can never collide (§4).
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpServerConfig {
+    /// Namespace prefix for this server's tools in the broker (e.g. a
+    /// `"time"` server's `now` tool registers as `time.now`).
+    pub name: String,
+    /// How to reach this server. Flattened so `transport = "stdio"` sits
+    /// alongside `name` at the same table level rather than nesting.
+    #[serde(flatten)]
+    pub transport: McpTransportConfig,
+}
+
+/// How to connect to one configured MCP server (§2.3: "stdio or HTTP
+/// transport per server").
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "transport", rename_all = "lowercase")]
+pub enum McpTransportConfig {
+    /// Launch `command` as a child process and speak line-delimited
+    /// JSON-RPC over its stdin/stdout — the common case for a local MCP
+    /// server.
+    Stdio {
+        /// Executable to launch.
+        command: String,
+        /// Arguments passed to `command`.
+        #[serde(default)]
+        args: Vec<String>,
+    },
+    /// Speak JSON-RPC to `url` over plain HTTP POST, one request per
+    /// call. No persistent connection and no server-initiated
+    /// notifications — sufficient for `tools/list`/`tools/call`, which is
+    /// all v1 needs.
+    Http {
+        /// Endpoint URL to POST JSON-RPC requests to.
+        url: String,
+    },
+}
+
 /// Audio input/output device selection (`[audio]`, EPIC 1.3).
 ///
 /// Absent from older config files entirely (the whole section defaults
@@ -199,6 +240,11 @@ pub struct Config {
     /// `[audio]` section is absent, so older config files keep loading.
     #[serde(default)]
     pub audio: AudioConfig,
+    /// Configured MCP servers (EPIC 6.4). Defaults to none, so a config
+    /// file written before MCP existed keeps loading with built-in tools
+    /// only.
+    #[serde(default)]
+    pub mcp: Vec<McpServerConfig>,
 }
 
 impl Config {

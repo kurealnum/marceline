@@ -13,9 +13,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use marceline_core::{
-    compile_system_prompt, resolve_max_iterations, think, Config, GetTimeTool, LlmEngine,
-    ListDirTool, OpenAiCompatibleEngine, ReadFileTool, SessionGuard, ToolBroker, TurnBuffer,
-    WebSearchTool,
+    compile_system_prompt, register_mcp_tools, resolve_max_iterations, think, Config, GetTimeTool,
+    LlmEngine, ListDirTool, OpenAiCompatibleEngine, ReadFileTool, SessionGuard, ToolBroker,
+    TurnBuffer, WebSearchTool,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -58,9 +58,10 @@ pub async fn say_to_llm(
     );
     let info = engine.info();
 
-    // v1 built-ins only (EPIC 6.2) — read-only, per the epic's key
-    // constraint. MCP tools (EPIC 6.4) merge into the same broker later
-    // without this call site changing.
+    // v1 built-ins (EPIC 6.2), read-only per the epic's key constraint,
+    // plus whatever MCP servers are configured (EPIC 6.4) — merged into
+    // the same broker, namespaced, so the THINKING loop below never has
+    // to know which is which.
     let mut broker = ToolBroker::new();
     broker.register(Arc::new(GetTimeTool)).expect("get_time is the first registration");
     broker.register(Arc::new(ReadFileTool)).expect("read_file is the first registration");
@@ -68,6 +69,9 @@ pub async fn say_to_llm(
     broker
         .register(Arc::new(WebSearchTool::new()?))
         .expect("web_search is the first registration");
+    for skipped in register_mcp_tools(&mut broker, &config.mcp).await {
+        tracing::warn!(server = %skipped, "mcp server unavailable, continuing without it");
+    }
 
     // One-shot CLI run: a single turn, but routed through `TurnBuffer` so
     // the context-window trimming this session would eventually need is
