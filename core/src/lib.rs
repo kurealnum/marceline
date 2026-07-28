@@ -12,6 +12,7 @@ pub mod logging;
 pub mod stt;
 pub mod supervisor;
 pub mod transcribe;
+pub mod tts;
 pub mod vad;
 pub mod wake;
 
@@ -35,5 +36,6 @@ pub use stt::{
 };
 pub use supervisor::{HealthView, Supervisor, WorkerSpec, WorkerState};
 pub use transcribe::{transcribe_segment, Transcription};
+pub use tts::{GrpcTtsEngine, TextStream, TtsEngine, TtsInfo, VoiceId};
 pub use vad::{SileroVad, VadEndpointer, VadError, DEFAULT_SPEECH_THRESHOLD, FRAME_SAMPLES};
 pub use wake::{EnergyWakeDetector, WakeDetector, WakeEngine, WakeEvent};
