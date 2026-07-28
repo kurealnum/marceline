@@ -14,12 +14,65 @@
 
 use std::collections::HashMap;
 
+use async_trait::async_trait;
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::engine::EngineError;
 use crate::llm::{ChatEvent, ChatEventStream, ChatRequest, FinishReason, LlmEngine, Message, ToolCallRequest, ToolSpec};
-use crate::tools::{ToolBroker, ToolResult};
+use crate::tools::{SafetyClass, ToolBroker, ToolResult};
+
+/// Message content fed back to the model when a tool call was gated by
+/// [`Confirm`] and the user declined (or nothing declined on its behalf,
+/// via [`DeclineAll`]).
+const DECLINED_NOTE: &str = "user declined to confirm this action; it was not run";
+
+/// Speaks a confirmation prompt and captures the user's spoken yes/no —
+/// the in-voice confirmation gate [`SafetyClass::SideEffecting`]/
+/// [`SafetyClass::Dangerous`] tools require before they may run (SPEC.md
+/// §2.5.1, §4, EPIC 6.5).
+///
+/// No real implementation exists yet: it needs an orchestrator that owns
+/// both TTS (to speak the prompt) and STT (to hear the answer), and
+/// nothing in this codebase assembles those together yet. `SOUL.md` tool
+/// policy (§3.2, EPIC 9.3) is what will decide *which* classes actually
+/// reach this gate — today every real tool is `ReadOnly` (§10), so
+/// [`think`] never calls this in practice. The seam exists now so that
+/// wiring a real voice confirmation later — or registering the first
+/// side-effecting tool (EPIC 14.3) — is a new [`Confirm`] impl, not a
+/// rewrite of this loop.
+#[async_trait]
+pub trait Confirm: Send + Sync {
+    /// Speaks `prompt` and returns `true` only on an affirmative spoken
+    /// reply.
+    async fn confirm(&self, prompt: &str) -> bool;
+}
+
+/// A [`Confirm`] that declines every prompt.
+///
+/// The safe default while no real voice-confirmation path exists: a
+/// side-effecting tool that somehow reached this gate must fail closed
+/// (not run) rather than auto-approve just because nothing real was
+/// wired in yet.
+pub struct DeclineAll;
+
+#[async_trait]
+impl Confirm for DeclineAll {
+    async fn confirm(&self, _prompt: &str) -> bool {
+        false
+    }
+}
+
+/// True when `class` requires [`Confirm`] before the tool may run.
+///
+/// A stand-in for SOUL.md tool policy (§3.2), which will make this
+/// decision per-tool once EPIC 9.3 wires it up; until then every class
+/// above `ReadOnly` always requires confirmation, and an unregistered
+/// name (`None`) requires nothing since [`ToolBroker::dispatch`] will
+/// reject it as unknown anyway.
+fn requires_confirmation(class: Option<SafetyClass>) -> bool {
+    matches!(class, Some(SafetyClass::SideEffecting) | Some(SafetyClass::Dangerous))
+}
 
 /// Environment variable overriding
 /// [`crate::config::LlmConfig::max_tool_iterations_per_turn`] (§3.1).
@@ -82,6 +135,11 @@ struct StreamOutcome {
 /// it rather than only once this returns. In v1, tool-requesting rounds
 /// rarely carry user-facing text alongside the calls, but nothing here
 /// assumes that.
+///
+/// `confirm` gates any [`SafetyClass::SideEffecting`]/`Dangerous` tool
+/// call (EPIC 6.5) — pass [`DeclineAll`] where no real voice confirmation
+/// exists yet, which is every call site today since v1 registers nothing
+/// above `ReadOnly` (§10).
 #[allow(clippy::too_many_arguments)]
 pub async fn think<E>(
     engine: &E,
@@ -91,6 +149,7 @@ pub async fn think<E>(
     max_tokens: u32,
     max_iterations: u32,
     cancel: CancellationToken,
+    confirm: &dyn Confirm,
     mut on_text: impl FnMut(&str),
 ) -> Result<(ThinkingOutcome, Vec<Message>), EngineError>
 where
@@ -150,6 +209,14 @@ where
         }
 
         for call in &round.tool_calls {
+            if requires_confirmation(broker.safety_class(&call.name)) {
+                let prompt = format!("Should I run {}? Say yes to confirm.", call.name);
+                if !confirm.confirm(&prompt).await {
+                    messages.push(Message::tool_result(call.id.clone(), DECLINED_NOTE));
+                    continue;
+                }
+            }
+
             let args = serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::Null);
             let result = broker.dispatch(&call.name, args, cancel.clone()).await;
             messages.push(Message::tool_result(call.id.clone(), tool_result_content(result)));

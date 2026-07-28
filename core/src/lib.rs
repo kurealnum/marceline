@@ -39,7 +39,9 @@ pub use stt::{
     TranscriptStream,
 };
 pub use supervisor::{HealthView, Supervisor, WorkerSpec, WorkerState};
-pub use thinking::{resolve_max_iterations, think, ThinkingOutcome, MAX_TOOL_ITERS_ENV};
+pub use thinking::{
+    resolve_max_iterations, think, Confirm, DeclineAll, ThinkingOutcome, MAX_TOOL_ITERS_ENV,
+};
 pub use tools::{
     DuplicateToolError, GetTimeTool, ListDirTool, ReadFileTool, SafetyClass, Tool, ToolBroker,
     ToolResult, WebSearchTool,

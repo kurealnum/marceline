@@ -13,9 +13,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use marceline_core::{
-    compile_system_prompt, register_mcp_tools, resolve_max_iterations, think, Config, GetTimeTool,
-    LlmEngine, ListDirTool, OpenAiCompatibleEngine, ReadFileTool, SessionGuard, ToolBroker,
-    TurnBuffer, WebSearchTool,
+    compile_system_prompt, register_mcp_tools, resolve_max_iterations, think, Config, DeclineAll,
+    GetTimeTool, LlmEngine, ListDirTool, OpenAiCompatibleEngine, ReadFileTool, SessionGuard,
+    ToolBroker, TurnBuffer, WebSearchTool,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -91,6 +91,10 @@ pub async fn say_to_llm(
         config.llm.max_tokens_per_turn,
         max_iterations,
         cancel,
+        // No real voice-confirmation path exists yet (EPIC 6.5 built the
+        // seam, nothing wires it up); v1 also registers nothing above
+        // ReadOnly (§10), so this is never actually consulted.
+        &DeclineAll,
         |delta| {
             let _ = stdout.write_all(delta.as_bytes());
             let _ = stdout.flush();
