@@ -40,6 +40,11 @@ class TtsStub(object):
                 request_serializer=tts__pb2.TtsRequest.SerializeToString,
                 response_deserializer=tts__pb2.TtsResponse.FromString,
                 _registered_method=True)
+        self.GetInfo = channel.unary_unary(
+                '/marceline.tts.Tts/GetInfo',
+                request_serializer=tts__pb2.TtsInfoRequest.SerializeToString,
+                response_deserializer=tts__pb2.TtsInfo.FromString,
+                _registered_method=True)
 
 
 class TtsServicer(object):
@@ -56,6 +61,15 @@ class TtsServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def GetInfo(self, request, context):
+        """Reports the loaded backend's capabilities, so the Rust side can build
+        its `TtsInfo` (§2.4) from what the worker actually loaded — voice ids
+        and output sample rate — rather than from what config asked for.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_TtsServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -63,6 +77,11 @@ def add_TtsServicer_to_server(servicer, server):
                     servicer.Synthesize,
                     request_deserializer=tts__pb2.TtsRequest.FromString,
                     response_serializer=tts__pb2.TtsResponse.SerializeToString,
+            ),
+            'GetInfo': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetInfo,
+                    request_deserializer=tts__pb2.TtsInfoRequest.FromString,
+                    response_serializer=tts__pb2.TtsInfo.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -93,6 +112,33 @@ class Tts(object):
             '/marceline.tts.Tts/Synthesize',
             tts__pb2.TtsRequest.SerializeToString,
             tts__pb2.TtsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetInfo(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/marceline.tts.Tts/GetInfo',
+            tts__pb2.TtsInfoRequest.SerializeToString,
+            tts__pb2.TtsInfo.FromString,
             options,
             channel_credentials,
             insecure,

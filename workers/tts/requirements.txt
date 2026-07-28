@@ -1,0 +1,14 @@
+# Pinned deps for the TTS worker (EPIC 5.1), from the worker template
+# plus the model-specific stack below the line.
+grpcio==1.66.2
+grpcio-health-checking==1.66.2
+protobuf>=5.26.1,<6.0dev
+
+# --- model-specific ---
+# numpy is also all the servicer's own tests need; kokoro/torch are only
+# pulled in by kokoro_backend.py, which worker.py imports lazily.
+numpy>=1.26,<3
+torch==2.4.1
+kokoro==0.9.4
+# Kokoro's grapheme-to-phoneme front end for English.
+misaki[en]==0.9.4
