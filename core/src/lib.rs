@@ -11,6 +11,8 @@ pub mod llm;
 pub mod logging;
 pub mod mcp;
 pub mod orchestrator;
+pub mod soul;
+pub mod soul_watch;
 pub mod stt;
 pub mod supervisor;
 pub mod thinking;
@@ -38,6 +40,7 @@ pub use mcp::{register_mcp_tools, McpCallOutcome, McpClient, McpError, McpTool, 
 pub use orchestrator::{
     ConversationEvent, ConversationState, FailedStage, IllegalTransition, Orchestrator, Stages,
 };
+pub use soul::{Persona, SoulError, ToolDecision, ToolPolicy, VoicePreference};
 pub use stt::{
     GrpcSttEngine, SttEngine, SttInfo, SttManager, SttWorkerPaths, SwapError, Transcript,
     TranscriptStream,
@@ -52,8 +55,8 @@ pub use tools::{
 };
 pub use transcribe::{transcribe_segment, Transcription};
 pub use tts::{
-    launch as launch_tts_worker, play, sentence_chunk, GrpcTtsEngine, PlaybackSink, TextStream,
-    TtsEngine, TtsInfo, TtsWorkerPaths, VoiceId,
+    launch as launch_tts_worker, play, resolve_voice, sentence_chunk, GrpcTtsEngine, PlaybackSink,
+    TextStream, TtsEngine, TtsInfo, TtsWorkerPaths, VoiceId,
 };
 pub use vad::{SileroVad, VadEndpointer, VadError, DEFAULT_SPEECH_THRESHOLD, FRAME_SAMPLES};
 pub use wake::{EnergyWakeDetector, WakeDetector, WakeEngine, WakeEvent};

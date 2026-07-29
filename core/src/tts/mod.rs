@@ -101,6 +101,30 @@ pub trait TtsEngine: Send + Sync {
     fn info(&self) -> TtsInfo;
 }
 
+/// Resolves SOUL.md's Voice preference (§3.2, EPIC 9.4) against what the
+/// connected backend actually advertises.
+///
+/// `preferred` is the voice id parsed out of SOUL.md, if any
+/// (`crate::soul::Persona::voice_preference`). An unknown/unavailable id —
+/// or no preference at all — falls back to `default` (`config.toml`'s
+/// `[tts].voice`, §3.1) rather than failing the turn; per §10, Kokoro's
+/// voice set is fixed, so a stale or typo'd SOUL preference is exactly the
+/// kind of thing that must degrade gracefully, not crash a reply.
+pub fn resolve_voice(preferred: Option<&str>, info: &TtsInfo, default: &VoiceId) -> VoiceId {
+    match preferred {
+        Some(id) if info.voices.iter().any(|v| v == id) => VoiceId::from(id),
+        Some(id) => {
+            tracing::warn!(
+                requested = id,
+                available = ?info.voices,
+                "SOUL.md's requested TTS voice is not in the backend's voice set; falling back to the configured default"
+            );
+            default.clone()
+        }
+        None => default.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,5 +137,39 @@ mod tests {
             VoiceId("af_sky".to_string())
         );
         assert_eq!(VoiceId::from("af_sky").to_string(), "af_sky");
+    }
+
+    fn info(voices: &[&str]) -> TtsInfo {
+        TtsInfo {
+            name: "test".to_string(),
+            voices: voices.iter().map(|v| v.to_string()).collect(),
+            output_sample_rate: 24_000,
+        }
+    }
+
+    #[test]
+    fn a_valid_preferred_voice_is_used() {
+        let resolved = resolve_voice(
+            Some("af_bella"),
+            &info(&["af_sky", "af_bella"]),
+            &VoiceId::from("af_sky"),
+        );
+        assert_eq!(resolved, VoiceId::from("af_bella"));
+    }
+
+    #[test]
+    fn an_unavailable_preferred_voice_falls_back_to_the_default() {
+        let resolved = resolve_voice(
+            Some("nonexistent_voice"),
+            &info(&["af_sky", "af_bella"]),
+            &VoiceId::from("af_sky"),
+        );
+        assert_eq!(resolved, VoiceId::from("af_sky"));
+    }
+
+    #[test]
+    fn no_preference_uses_the_default() {
+        let resolved = resolve_voice(None, &info(&["af_sky", "af_bella"]), &VoiceId::from("af_sky"));
+        assert_eq!(resolved, VoiceId::from("af_sky"));
     }
 }

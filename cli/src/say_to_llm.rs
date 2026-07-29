@@ -12,6 +12,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use marceline_core::soul::Persona;
 use marceline_core::{
     compile_system_prompt, register_mcp_tools, resolve_max_iterations, think, Config, DeclineAll,
     GetTimeTool, LlmEngine, ListDirTool, OpenAiCompatibleEngine, ReadFileTool, SessionGuard,
@@ -43,8 +44,8 @@ pub async fn say_to_llm(
     text: &str,
 ) -> Result<(), SayToLlmError> {
     let config = Config::load(config_path)?;
-    let soul = std::fs::read_to_string(soul_path).unwrap_or_default();
-    let system_prompt = compile_system_prompt(&soul, &[]);
+    let persona = Persona::load(soul_path).unwrap_or_default();
+    let system_prompt = compile_system_prompt(&persona.render(), &[]);
 
     let cancel = CancellationToken::new();
     let engine = OpenAiCompatibleEngine::new(&config.llm, cancel.clone())?;
@@ -82,12 +83,14 @@ pub async fn say_to_llm(
 
     let mut stdout = std::io::stdout();
     let max_iterations = resolve_max_iterations(config.llm.max_tool_iterations_per_turn);
+    let policy = persona.tool_policy();
 
     let (outcome, _messages) = think(
         &engine,
         &broker,
         messages,
         broker.catalog(),
+        &policy,
         config.llm.max_tokens_per_turn,
         max_iterations,
         cancel,
@@ -95,7 +98,7 @@ pub async fn say_to_llm(
         // seam, nothing wires it up); v1 also registers nothing above
         // ReadOnly (§10), so this is never actually consulted.
         &DeclineAll,
-        |delta| {
+        |delta: &str| {
             let _ = stdout.write_all(delta.as_bytes());
             let _ = stdout.flush();
         },

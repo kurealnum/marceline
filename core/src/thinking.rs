@@ -20,12 +20,17 @@ use tokio_util::sync::CancellationToken;
 
 use crate::engine::EngineError;
 use crate::llm::{ChatEvent, ChatEventStream, ChatRequest, FinishReason, LlmEngine, Message, ToolCallRequest, ToolSpec};
-use crate::tools::{SafetyClass, ToolBroker, ToolResult};
+use crate::soul::{ToolDecision, ToolPolicy};
+use crate::tools::{ToolBroker, ToolResult};
 
 /// Message content fed back to the model when a tool call was gated by
 /// [`Confirm`] and the user declined (or nothing declined on its behalf,
 /// via [`DeclineAll`]).
 const DECLINED_NOTE: &str = "user declined to confirm this action; it was not run";
+
+/// Message content fed back to the model when it called a tool SOUL.md's
+/// Tools policy (§3.2, EPIC 9.3) turned off.
+const OFF_NOTE: &str = "this tool is turned off by policy and cannot be run";
 
 /// Speaks a confirmation prompt and captures the user's spoken yes/no —
 /// the in-voice confirmation gate [`SafetyClass::SideEffecting`]/
@@ -63,15 +68,17 @@ impl Confirm for DeclineAll {
     }
 }
 
-/// True when `class` requires [`Confirm`] before the tool may run.
-///
-/// A stand-in for SOUL.md tool policy (§3.2), which will make this
-/// decision per-tool once EPIC 9.3 wires it up; until then every class
-/// above `ReadOnly` always requires confirmation, and an unregistered
-/// name (`None`) requires nothing since [`ToolBroker::dispatch`] will
-/// reject it as unknown anyway.
-fn requires_confirmation(class: Option<SafetyClass>) -> bool {
-    matches!(class, Some(SafetyClass::SideEffecting) | Some(SafetyClass::Dangerous))
+/// The effective [`ToolDecision`] for a tool call: `policy`'s per-tool
+/// decision (SOUL.md's Tools policy section, §3.2, EPIC 9.3) if `name` is
+/// registered on `broker`, else [`ToolDecision::Off`] — an unregistered
+/// name is never auto-run or confirmed into existence; [`ToolBroker::dispatch`]
+/// will reject it as unknown regardless, so treating it as `Off` here just
+/// skips the pointless confirmation prompt.
+fn tool_decision(broker: &ToolBroker, policy: &ToolPolicy, name: &str) -> ToolDecision {
+    match broker.safety_class(name) {
+        Some(class) => policy.decision(name, class),
+        None => ToolDecision::Off,
+    }
 }
 
 /// Environment variable overriding
@@ -136,16 +143,21 @@ struct StreamOutcome {
 /// rarely carry user-facing text alongside the calls, but nothing here
 /// assumes that.
 ///
-/// `confirm` gates any [`SafetyClass::SideEffecting`]/`Dangerous` tool
-/// call (EPIC 6.5) — pass [`DeclineAll`] where no real voice confirmation
-/// exists yet, which is every call site today since v1 registers nothing
-/// above `ReadOnly` (§10).
+/// `confirm` gates any tool call `policy` decides needs confirmation
+/// (EPIC 6.5/9.3) — pass [`DeclineAll`] where no real voice confirmation
+/// exists yet.
+///
+/// `tools` is filtered against `policy` before ever reaching the model:
+/// a tool `policy` decides is [`ToolDecision::Off`] is dropped from the
+/// offered catalog entirely, not merely refused at dispatch time, so the
+/// model never sees it as an option (§3.2's "tools ... which are off").
 #[allow(clippy::too_many_arguments)]
 pub async fn think<E>(
     engine: &E,
     broker: &ToolBroker,
     mut messages: Vec<Message>,
     tools: Vec<ToolSpec>,
+    policy: &ToolPolicy,
     max_tokens: u32,
     max_iterations: u32,
     cancel: CancellationToken,
@@ -155,6 +167,11 @@ pub async fn think<E>(
 where
     E: LlmEngine + ?Sized,
 {
+    let tools: Vec<ToolSpec> = tools
+        .into_iter()
+        .filter(|spec| tool_decision(broker, policy, &spec.name) != ToolDecision::Off)
+        .collect();
+
     let mut iterations: u32 = 0;
 
     loop {
@@ -220,12 +237,23 @@ where
                 return Err(EngineError::Cancelled { backend: "llm" });
             }
 
-            if requires_confirmation(broker.safety_class(&call.name)) {
-                let prompt = format!("Should I run {}? Say yes to confirm.", call.name);
-                if !confirm.confirm(&prompt).await {
-                    messages.push(Message::tool_result(call.id.clone(), DECLINED_NOTE));
+            match tool_decision(broker, policy, &call.name) {
+                // Filtered out of the offered catalog above, but a model
+                // can still hallucinate a call to a name it was never
+                // given — fail closed the same as an outright decline
+                // rather than falling through to dispatch.
+                ToolDecision::Off => {
+                    messages.push(Message::tool_result(call.id.clone(), OFF_NOTE));
                     continue;
                 }
+                ToolDecision::Confirm => {
+                    let prompt = format!("Should I run {}? Say yes to confirm.", call.name);
+                    if !confirm.confirm(&prompt).await {
+                        messages.push(Message::tool_result(call.id.clone(), DECLINED_NOTE));
+                        continue;
+                    }
+                }
+                ToolDecision::Auto => {}
             }
 
             let args = serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::Null);
