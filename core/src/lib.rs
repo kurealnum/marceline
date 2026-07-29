@@ -3,6 +3,7 @@
 pub mod audio;
 pub mod config;
 pub mod config_edit;
+pub mod context;
 pub mod device;
 pub mod engine;
 pub mod gate;
@@ -29,6 +30,7 @@ pub use audio::{
 };
 pub use config::{Config, ConfigError};
 pub use config_edit::ConfigEditError;
+pub use context::recent_context;
 pub use device::Device;
 pub use engine::{AudioStream, EngineError};
 pub use gate::{Gate, GateOutput, GateState};
