@@ -6,11 +6,10 @@
 //! injected here, never written back into SOUL.md, which is what lets
 //! SOUL.md stay hot-reloadable without fighting the summarizer.
 //!
-//! The full SOUL.md → structured-persona compiler is EPIC 9.1 and does not
-//! exist yet; until it lands, [`compile_system_prompt`] takes the file's raw
-//! text as the persona. That is a strictly weaker input (no section
-//! validation), not a different contract — 9.1 slots in by replacing the
-//! `soul: &str` parameter with its structured output's rendered form.
+//! [`compile_system_prompt`] takes the persona as plain text: pass
+//! [`crate::soul::Persona::render`]'s output (EPIC 9.1's parsed, canonical
+//! rendering of `SOUL.md`), or `SOUL.md`'s raw text as a strictly weaker
+//! fallback with no section validation.
 
 /// Where one [`MemoryEntry`] came from (SPEC.md §5.1).
 ///

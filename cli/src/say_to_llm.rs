@@ -12,6 +12,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use marceline_core::soul::Persona;
 use marceline_core::{
     compile_system_prompt, register_mcp_tools, resolve_max_iterations, think, Config, DeclineAll,
     GetTimeTool, LlmEngine, ListDirTool, OpenAiCompatibleEngine, ReadFileTool, SessionGuard,
@@ -43,8 +44,8 @@ pub async fn say_to_llm(
     text: &str,
 ) -> Result<(), SayToLlmError> {
     let config = Config::load(config_path)?;
-    let soul = std::fs::read_to_string(soul_path).unwrap_or_default();
-    let system_prompt = compile_system_prompt(&soul, &[]);
+    let persona = Persona::load(soul_path).unwrap_or_default();
+    let system_prompt = compile_system_prompt(&persona.render(), &[]);
 
     let cancel = CancellationToken::new();
     let engine = OpenAiCompatibleEngine::new(&config.llm, cancel.clone())?;

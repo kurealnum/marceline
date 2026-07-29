@@ -48,6 +48,7 @@ use marceline_core::{
     TtsEngine, VadEndpointer, VoiceId, DEFAULT_SPEECH_THRESHOLD,
 };
 use marceline_core::audio::Capture;
+use marceline_core::soul::Persona;
 use tokio::sync::{watch, RwLock};
 use tokio_util::sync::CancellationToken;
 
@@ -156,8 +157,8 @@ const WAKE_POLL_TIMEOUT: Duration = Duration::from_millis(200);
 /// through the orchestrator's `ERROR` edge and the loop keeps running.
 pub async fn converse(config_path: &Path, soul_path: &Path) -> Result<(), ConverseError> {
     let config = Config::load(config_path)?;
-    let soul = std::fs::read_to_string(soul_path).unwrap_or_default();
-    let system_prompt = compile_system_prompt(&soul, &[]);
+    let persona = Persona::load(soul_path).unwrap_or_default();
+    let system_prompt = compile_system_prompt(&persona.render(), &[]);
 
     let capture = Capture::start(1.5, config.audio.input_device.as_deref())?;
     let detector = EnergyWakeDetector::new(config.wake.sensitivity, 16_000, 1600);
