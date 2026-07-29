@@ -11,6 +11,7 @@ pub mod llm;
 pub mod logging;
 pub mod mcp;
 pub mod orchestrator;
+pub mod soul;
 pub mod stt;
 pub mod supervisor;
 pub mod thinking;
