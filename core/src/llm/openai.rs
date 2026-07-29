@@ -19,7 +19,10 @@ use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use super::{ChatEvent, ChatEventStream, ChatRequest, FinishReason, LlmEngine, LlmInfo, Message, Role, ToolSpec};
+use super::{
+    ChatEvent, ChatEventStream, ChatRequest, FinishReason, LlmEngine, LlmInfo, Message, Role,
+    ToolSpec,
+};
 use crate::config::LlmConfig;
 use crate::engine::EngineError;
 
@@ -366,6 +369,15 @@ impl<'a> WireRequest<'a> {
 struct WireMessage<'a> {
     role: &'a str,
     content: &'a str,
+    /// Only an assistant message that requested tools carries these
+    /// (EPIC 6.3); omitted entirely for every other message so a strict
+    /// backend does not see a stray empty array on a plain turn.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tool_calls: Vec<WireOutToolCall<'a>>,
+    /// Only a `Role::Tool` message carries this, linking it back to the
+    /// assistant `tool_calls` entry it answers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<&'a str>,
 }
 
 impl<'a> From<&'a Message> for WireMessage<'a> {
@@ -378,6 +390,38 @@ impl<'a> From<&'a Message> for WireMessage<'a> {
                 Role::Tool => "tool",
             },
             content: &message.content,
+            tool_calls: message.tool_calls.iter().map(WireOutToolCall::from).collect(),
+            tool_call_id: message.tool_call_id.as_deref(),
+        }
+    }
+}
+
+/// One tool call on the wire, as replayed on an assistant message that
+/// requested tools (EPIC 6.3) — the outbound mirror of [`WireToolCall`],
+/// which parses the *inbound* streamed shape.
+#[derive(Debug, Serialize)]
+struct WireOutToolCall<'a> {
+    id: &'a str,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: WireOutToolCallFunction<'a>,
+}
+
+#[derive(Debug, Serialize)]
+struct WireOutToolCallFunction<'a> {
+    name: &'a str,
+    arguments: &'a str,
+}
+
+impl<'a> From<&'a super::ToolCallRequest> for WireOutToolCall<'a> {
+    fn from(call: &'a super::ToolCallRequest) -> Self {
+        Self {
+            id: &call.id,
+            kind: "function",
+            function: WireOutToolCallFunction {
+                name: &call.name,
+                arguments: &call.arguments,
+            },
         }
     }
 }

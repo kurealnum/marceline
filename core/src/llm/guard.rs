@@ -138,10 +138,7 @@ mod tests {
 
     fn request(max_tokens: u32) -> ChatRequest {
         ChatRequest {
-            messages: vec![Message {
-                role: Role::User,
-                content: "hi".to_string(),
-            }],
+            messages: vec![Message::new(Role::User, "hi")],
             tools: Vec::<ToolSpec>::new(),
             max_tokens,
         }

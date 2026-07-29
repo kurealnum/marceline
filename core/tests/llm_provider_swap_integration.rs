@@ -84,10 +84,7 @@ async fn run_hello(base_url: String, env_var: &'static str) -> Vec<ChatEvent> {
     let config = config_for(base_url, env_var);
     let engine = OpenAiCompatibleEngine::new(&config, CancellationToken::new()).expect("engine");
     let request = ChatRequest {
-        messages: vec![Message {
-            role: Role::User,
-            content: "hello".to_string(),
-        }],
+        messages: vec![Message::new(Role::User, "hello")],
         tools: vec![],
         max_tokens: 512,
     };
@@ -180,10 +177,7 @@ async fn base_url_is_the_only_thing_that_differs_between_runs() {
     let engine = OpenAiCompatibleEngine::new(&config, CancellationToken::new()).expect("engine");
     let events_b: Vec<_> = engine
         .chat(ChatRequest {
-            messages: vec![Message {
-                role: Role::User,
-                content: "hello".to_string(),
-            }],
+            messages: vec![Message::new(Role::User, "hello")],
             tools: vec![],
             max_tokens: 512,
         })

@@ -83,10 +83,7 @@ fn test_config(base_url: String) -> LlmConfig {
 
 fn user_request(text: &str) -> ChatRequest {
     ChatRequest {
-        messages: vec![Message {
-            role: Role::User,
-            content: text.to_string(),
-        }],
+        messages: vec![Message::new(Role::User, text)],
         tools: vec![],
         max_tokens: 512,
     }
