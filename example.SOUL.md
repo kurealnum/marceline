@@ -16,7 +16,9 @@ Timezone: US/Eastern.
 
 # Tools policy
 
-Shell commands: confirm before running. Web search: auto-run. File deletion: off.
+shell.run: confirm
+web_search: auto
+delete_file: off
 
 # Examples
 

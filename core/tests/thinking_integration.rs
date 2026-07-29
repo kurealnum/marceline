@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 use marceline_core::config::LlmConfig;
 use marceline_core::{
     resolve_max_iterations, think, FinishReason, Message, OpenAiCompatibleEngine, Role,
-    SafetyClass, Tool, ToolBroker, ToolResult, MAX_TOOL_ITERS_ENV,
+    SafetyClass, Tool, ToolBroker, ToolPolicy, ToolResult, MAX_TOOL_ITERS_ENV,
 };
 
 /// One canned SSE response: a sequence of `data: ...\n\n` lines.
@@ -226,6 +226,7 @@ async fn a_tool_call_is_run_and_its_result_feeds_a_final_answer() {
         &broker,
         messages,
         broker.catalog(),
+        &ToolPolicy::default(),
         512,
         8,
         CancellationToken::new(),
@@ -275,6 +276,7 @@ async fn hitting_the_iteration_cap_forces_a_final_answer_without_running_the_too
         &broker,
         messages,
         broker.catalog(),
+        &ToolPolicy::default(),
         512,
         0,
         CancellationToken::new(),
@@ -312,6 +314,7 @@ async fn a_final_answer_with_no_tool_calls_is_a_single_round() {
         &broker,
         messages,
         broker.catalog(),
+        &ToolPolicy::default(),
         512,
         8,
         CancellationToken::new(),
@@ -370,6 +373,7 @@ async fn a_side_effecting_tool_is_confirmed_before_it_runs() {
         &broker,
         messages,
         broker.catalog(),
+        &ToolPolicy::default(),
         512,
         8,
         CancellationToken::new(),
@@ -383,6 +387,95 @@ async fn a_side_effecting_tool_is_confirmed_before_it_runs() {
     assert_eq!(calls.lock().unwrap().len(), 1, "approved call must run");
     assert_eq!(prompts.lock().unwrap().len(), 1, "must have asked exactly once");
     assert!(prompts.lock().unwrap()[0].contains("delete_file"));
+}
+
+#[tokio::test]
+async fn soul_policy_off_excludes_the_tool_from_the_catalog_and_never_dispatches_it() {
+    // The model still asks for it — it can hallucinate a call to a name it
+    // was never offered — but with the policy set to "off" it must be
+    // refused before the (never-approving) confirm gate is even consulted.
+    let (base_url, bodies) = start_scripted_server(vec![
+        side_effecting_call_round(),
+        final_round("Can't do that."),
+    ])
+    .await;
+    let config = test_config(base_url);
+    let engine = OpenAiCompatibleEngine::new(&config, CancellationToken::new()).expect("engine");
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut broker = ToolBroker::new();
+    broker.register(Arc::new(RecordingTool::side_effecting(Arc::clone(&calls)))).unwrap();
+
+    let policy = ToolPolicy::parse("delete_file: off\n");
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let confirm = FakeConfirm {
+        approve: true,
+        prompts: Arc::clone(&prompts),
+    };
+
+    let messages = vec![Message::new(Role::User, "delete the file")];
+    let (outcome, _messages) = think(
+        &engine,
+        &broker,
+        messages,
+        broker.catalog(),
+        &policy,
+        512,
+        8,
+        CancellationToken::new(),
+        &confirm,
+        |_| {},
+    )
+    .await
+    .expect("thinking loop succeeds");
+
+    assert_eq!(outcome.text, "Can't do that.");
+    assert!(calls.lock().unwrap().is_empty(), "an off tool must never dispatch");
+    assert!(prompts.lock().unwrap().is_empty(), "an off tool must not ask for confirmation");
+    // The first request's catalog must never have offered `delete_file`.
+    assert!(!bodies.lock().unwrap()[0].contains("delete_file"));
+}
+
+#[tokio::test]
+async fn soul_policy_auto_override_skips_confirmation_for_a_side_effecting_tool() {
+    let (base_url, _bodies) = start_scripted_server(vec![
+        side_effecting_call_round(),
+        final_round("Deleted it."),
+    ])
+    .await;
+    let config = test_config(base_url);
+    let engine = OpenAiCompatibleEngine::new(&config, CancellationToken::new()).expect("engine");
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut broker = ToolBroker::new();
+    broker.register(Arc::new(RecordingTool::side_effecting(Arc::clone(&calls)))).unwrap();
+
+    let policy = ToolPolicy::parse("delete_file: auto\n");
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let confirm = FakeConfirm {
+        approve: false,
+        prompts: Arc::clone(&prompts),
+    };
+
+    let messages = vec![Message::new(Role::User, "delete the file")];
+    let (outcome, _messages) = think(
+        &engine,
+        &broker,
+        messages,
+        broker.catalog(),
+        &policy,
+        512,
+        8,
+        CancellationToken::new(),
+        &confirm,
+        |_| {},
+    )
+    .await
+    .expect("thinking loop succeeds");
+
+    assert_eq!(outcome.text, "Deleted it.");
+    assert_eq!(calls.lock().unwrap().len(), 1, "auto-run must dispatch without asking");
+    assert!(prompts.lock().unwrap().is_empty(), "auto-run must never consult confirm");
 }
 
 #[tokio::test]
@@ -410,6 +503,7 @@ async fn declining_confirmation_skips_the_tool_and_feeds_a_declined_result_back(
         &broker,
         messages,
         broker.catalog(),
+        &ToolPolicy::default(),
         512,
         8,
         CancellationToken::new(),
@@ -446,6 +540,7 @@ async fn with_no_side_effecting_tool_registered_the_loop_behaves_as_plain_read_o
         &broker,
         messages,
         broker.catalog(),
+        &ToolPolicy::default(),
         512,
         8,
         CancellationToken::new(),
@@ -533,6 +628,7 @@ async fn firing_the_run_token_mid_tool_call_aborts_it_and_discards_the_result() 
             &broker,
             messages,
             broker.catalog(),
+            &ToolPolicy::default(),
             512,
             8,
             cancel,

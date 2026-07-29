@@ -10,8 +10,11 @@
 //! recognized heading, mirroring how an unlabeled preamble in a persona file
 //! has nowhere principled to go).
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use crate::tools::SafetyClass;
 
 /// Errors that can occur while loading a `SOUL.md` file from disk.
 ///
@@ -167,6 +170,14 @@ impl Persona {
         persona
     }
 
+    /// Parses this persona's Tools policy section into a [`ToolPolicy`]
+    /// (§3.2, EPIC 9.3). An absent section yields an empty policy, which
+    /// still gates every tool via [`ToolPolicy::decision`]'s per-class
+    /// default.
+    pub fn tool_policy(&self) -> ToolPolicy {
+        ToolPolicy::parse(self.tools_policy.as_deref().unwrap_or(""))
+    }
+
     /// Renders this persona back to canonical markdown, in the fixed order
     /// §3.2 suggests, for the system-prompt compiler to consume in place of
     /// `SOUL.md`'s raw text.
@@ -197,6 +208,78 @@ impl Persona {
             }
         }
         out
+    }
+}
+
+/// A per-tool decision from SOUL.md's Tools policy section (§3.2), consumed
+/// by the THINKING loop's gating (EPIC 6.5/9.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolDecision {
+    /// Runs without a spoken confirmation.
+    Auto,
+    /// Requires a spoken confirmation before running (EPIC 6.5).
+    Confirm,
+    /// Never offered to the model and never dispatched.
+    Off,
+}
+
+/// Per-tool policy parsed from SOUL.md's `# Tools policy` section (§3.2).
+///
+/// Covers both built-in and MCP tool names (the latter namespaced
+/// `serverName.toolName`, §4) — the parser doesn't distinguish them, since a
+/// policy line is just a name-to-decision mapping either way.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolPolicy {
+    decisions: HashMap<String, ToolDecision>,
+}
+
+impl ToolPolicy {
+    /// Parses free-form `name: decision` lines (an optional leading
+    /// `-`/`*` list marker is stripped first). SOUL.md's Tools policy
+    /// section is prose the user wrote, not a strict format: a line that
+    /// doesn't match `name: decision`, or whose decision isn't recognized,
+    /// is silently skipped rather than rejected — same tolerance 9.1's
+    /// section parser applies to the rest of the file.
+    pub fn parse(text: &str) -> ToolPolicy {
+        let mut decisions = HashMap::new();
+        for line in text.lines() {
+            let line = line.trim().trim_start_matches(['-', '*']).trim();
+            let Some((name, decision)) = line.split_once(':') else {
+                continue;
+            };
+            let name = name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            let decision = match decision.trim().to_lowercase().as_str() {
+                "auto" | "auto-run" | "auto run" | "allow" | "allowed" => ToolDecision::Auto,
+                "confirm" | "confirmation" | "ask" => ToolDecision::Confirm,
+                "off" | "disabled" | "disallow" | "never" => ToolDecision::Off,
+                _ => continue,
+            };
+            decisions.insert(name.to_string(), decision);
+        }
+        ToolPolicy { decisions }
+    }
+
+    /// The effective decision for a tool named `name` registered with
+    /// `class`.
+    ///
+    /// An explicit policy entry always wins. Absent one, a sane default
+    /// applies: [`SafetyClass::ReadOnly`] auto-runs, anything higher
+    /// requires confirmation — matching EPIC 14.2's "third-party tools
+    /// default to confirmation-gated, not auto-run." This method only
+    /// decides policy; it never elevates a tool the broker refused to
+    /// register in the first place (§14.3), since an unregistered name
+    /// never reaches here.
+    pub fn decision(&self, name: &str, class: SafetyClass) -> ToolDecision {
+        if let Some(decision) = self.decisions.get(name) {
+            return *decision;
+        }
+        match class {
+            SafetyClass::ReadOnly => ToolDecision::Auto,
+            SafetyClass::SideEffecting | SafetyClass::Dangerous => ToolDecision::Confirm,
+        }
     }
 }
 
@@ -330,5 +413,51 @@ Marceline.
     fn load_surfaces_io_error_for_missing_file() {
         let err = Persona::load("/nonexistent/path/SOUL.md").unwrap_err();
         assert!(matches!(err, SoulError::Io { .. }));
+    }
+
+    #[test]
+    fn tool_policy_parses_explicit_decisions() {
+        let policy = ToolPolicy::parse(
+            "- shell.run: confirm\n* web_search: auto\ndelete_file: off\nnot a policy line\n",
+        );
+        assert_eq!(
+            policy.decision("shell.run", SafetyClass::ReadOnly),
+            ToolDecision::Confirm
+        );
+        assert_eq!(
+            policy.decision("web_search", SafetyClass::SideEffecting),
+            ToolDecision::Auto
+        );
+        assert_eq!(
+            policy.decision("delete_file", SafetyClass::ReadOnly),
+            ToolDecision::Off
+        );
+    }
+
+    #[test]
+    fn tool_policy_falls_back_to_class_default_when_unlisted() {
+        let policy = ToolPolicy::default();
+        assert_eq!(
+            policy.decision("get_time", SafetyClass::ReadOnly),
+            ToolDecision::Auto
+        );
+        assert_eq!(
+            policy.decision("send_email", SafetyClass::SideEffecting),
+            ToolDecision::Confirm
+        );
+        assert_eq!(
+            policy.decision("rm_rf", SafetyClass::Dangerous),
+            ToolDecision::Confirm
+        );
+    }
+
+    #[test]
+    fn persona_tool_policy_reads_the_tools_policy_section() {
+        let persona = Persona::parse("# Tools policy\n\nshell.run: confirm\n");
+        let policy = persona.tool_policy();
+        assert_eq!(
+            policy.decision("shell.run", SafetyClass::ReadOnly),
+            ToolDecision::Confirm
+        );
     }
 }

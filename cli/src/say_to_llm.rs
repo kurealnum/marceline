@@ -83,12 +83,14 @@ pub async fn say_to_llm(
 
     let mut stdout = std::io::stdout();
     let max_iterations = resolve_max_iterations(config.llm.max_tool_iterations_per_turn);
+    let policy = persona.tool_policy();
 
     let (outcome, _messages) = think(
         &engine,
         &broker,
         messages,
         broker.catalog(),
+        &policy,
         config.llm.max_tokens_per_turn,
         max_iterations,
         cancel,
@@ -96,7 +98,7 @@ pub async fn say_to_llm(
         // seam, nothing wires it up); v1 also registers nothing above
         // ReadOnly (§10), so this is never actually consulted.
         &DeclineAll,
-        |delta| {
+        |delta: &str| {
             let _ = stdout.write_all(delta.as_bytes());
             let _ = stdout.flush();
         },
