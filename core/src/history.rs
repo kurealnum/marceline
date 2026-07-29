@@ -99,6 +99,15 @@ pub enum HistoryError {
         /// Dimension of the vector that was passed in.
         got: usize,
     },
+    /// An edit or delete named a memory row id that doesn't exist — most
+    /// likely a typo, or the row was already deleted by a previous command
+    /// (EPIC 10.6's CLI). Reported as a clear error rather than silently
+    /// no-oping, since a no-op edit/delete would look like it worked.
+    #[error("no memory with id {id}")]
+    NotFound {
+        /// The row id that was not found.
+        id: i64,
+    },
 }
 
 /// Where a stored [`TurnRecord`] came from (SPEC.md §5.1).
@@ -359,6 +368,26 @@ enum WriteCommand {
         vectors: Vec<(i64, Vec<f32>)>,
         reply: std_mpsc::SyncSender<Result<usize, HistoryError>>,
     },
+    /// Overwrites an existing memory's source text and vector in place
+    /// (EPIC 10.6's `marceline memory edit`) — the caller (`crate::memory`
+    /// or the CLI) must have already recomputed `vector` from `text` under
+    /// the current embedding pipeline, since editing a memory's text
+    /// without re-embedding would leave a stale vector pointing at text
+    /// that no longer exists (SPEC.md §5, "auditable and editable").
+    UpdateMemoryText {
+        id: i64,
+        text: String,
+        vector: Vec<f32>,
+        embed_model: String,
+        reply: std_mpsc::SyncSender<Result<(), HistoryError>>,
+    },
+    /// Deletes a memory row and its vector together (EPIC 10.6's
+    /// `marceline memory forget`), in one transaction so a reader never
+    /// observes one half deleted without the other.
+    DeleteMemory {
+        id: i64,
+        reply: std_mpsc::SyncSender<Result<(), HistoryError>>,
+    },
 }
 
 /// Handle to the persistent history store (EPIC 10.1).
@@ -478,6 +507,62 @@ impl HistoryStore {
                             }
                             tx.commit()?;
                             Ok(vectors.len())
+                        })();
+                        let _ = reply.send(result);
+                    }
+                    WriteCommand::UpdateMemoryText {
+                        id,
+                        text,
+                        vector,
+                        embed_model,
+                        reply,
+                    } => {
+                        let result = (|| -> Result<(), HistoryError> {
+                            let exists = conn
+                                .query_row(
+                                    "SELECT 1 FROM memories WHERE id = ?1",
+                                    params![id],
+                                    |_| Ok(()),
+                                )
+                                .optional()?
+                                .is_some();
+                            if !exists {
+                                return Err(HistoryError::NotFound { id });
+                            }
+                            let dim = vector.len();
+                            ensure_vec_table(&conn, dim)?;
+                            let tx = conn.unchecked_transaction()?;
+                            tx.execute(
+                                "UPDATE memories SET text = ?1, embed_model = ?2, dim = ?3 WHERE id = ?4",
+                                params![text, embed_model, dim as i64, id],
+                            )?;
+                            tx.execute(
+                                "DELETE FROM memories_vec WHERE rowid = ?1",
+                                params![id],
+                            )?;
+                            tx.execute(
+                                "INSERT INTO memories_vec (rowid, embedding) VALUES (?1, ?2)",
+                                params![id, vector_to_blob(&vector)],
+                            )?;
+                            tx.commit()?;
+                            Ok(())
+                        })();
+                        let _ = reply.send(result);
+                    }
+                    WriteCommand::DeleteMemory { id, reply } => {
+                        let result = (|| -> Result<(), HistoryError> {
+                            let tx = conn.unchecked_transaction()?;
+                            let changed =
+                                tx.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
+                            if changed == 0 {
+                                return Err(HistoryError::NotFound { id });
+                            }
+                            tx.execute(
+                                "DELETE FROM memories_vec WHERE rowid = ?1",
+                                params![id],
+                            )?;
+                            tx.commit()?;
+                            Ok(())
                         })();
                         let _ = reply.send(result);
                     }
@@ -684,6 +769,52 @@ impl HistoryStore {
             .map_err(|_| HistoryError::WriteActorGone)?;
         reply_rx.recv().map_err(|_| HistoryError::WriteActorGone)?
     }
+
+    /// Overwrites memory `id`'s source text, embedding vector, and
+    /// `embed_model` id via the write actor (EPIC 10.6's `marceline memory
+    /// edit`).
+    ///
+    /// Callers must recompute `vector` from `text` under the current
+    /// embedding pipeline before calling this — passing the old vector
+    /// alongside new `text` would leave a stale vector that no longer
+    /// matches the row's text, defeating the point of storing text at all
+    /// (SPEC.md §5's "auditable and editable"). Returns
+    /// [`HistoryError::NotFound`] if `id` doesn't exist, rather than
+    /// silently inserting nothing.
+    pub fn update_memory_text(
+        &self,
+        id: i64,
+        text: impl Into<String>,
+        vector: Vec<f32>,
+        embed_model: impl Into<String>,
+    ) -> Result<(), HistoryError> {
+        let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
+        self.write_tx
+            .send(WriteCommand::UpdateMemoryText {
+                id,
+                text: text.into(),
+                vector,
+                embed_model: embed_model.into(),
+                reply: reply_tx,
+            })
+            .map_err(|_| HistoryError::WriteActorGone)?;
+        reply_rx.recv().map_err(|_| HistoryError::WriteActorGone)?
+    }
+
+    /// Deletes memory `id` — both its `memories` row and its
+    /// `memories_vec` vector — via the write actor, in one transaction
+    /// (EPIC 10.6's `marceline memory forget`).
+    ///
+    /// Returns [`HistoryError::NotFound`] if `id` doesn't exist, rather
+    /// than silently no-oping — a delete that doesn't report success or
+    /// failure clearly is not auditable (SPEC.md §5).
+    pub fn delete_memory(&self, id: i64) -> Result<(), HistoryError> {
+        let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
+        self.write_tx
+            .send(WriteCommand::DeleteMemory { id, reply: reply_tx })
+            .map_err(|_| HistoryError::WriteActorGone)?;
+        reply_rx.recv().map_err(|_| HistoryError::WriteActorGone)?
+    }
 }
 
 #[cfg(test)]
@@ -820,5 +951,84 @@ mod tests {
 
         let turns = store.recent_turns("s1", 100).unwrap();
         assert_eq!(turns.len(), 8);
+    }
+
+    fn new_memory(text: &str, vector: Vec<f32>) -> NewMemory {
+        NewMemory {
+            text: text.to_string(),
+            embed_model: "fake-v1".to_string(),
+            vector,
+            provenance: Trust::User,
+            created_at_ms: 1_000,
+        }
+    }
+
+    #[test]
+    fn update_memory_text_changes_text_and_vector() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HistoryStore::open(dir.path().join("history.db")).unwrap();
+
+        let id = store
+            .insert_memory(new_memory("old text", vec![1.0, 0.0, 0.0]))
+            .unwrap();
+
+        store
+            .update_memory_text(id, "new text", vec![0.0, 1.0, 0.0], "fake-v2")
+            .unwrap();
+
+        let record = store.get_memory(id).unwrap().unwrap();
+        assert_eq!(record.text, "new text");
+        assert_eq!(record.embed_model, "fake-v2");
+
+        // The new vector is what search now ranks against — searching for
+        // the old vector's direction no longer finds this row as its
+        // nearest match, and searching for the new vector's direction does,
+        // proving the old vector is gone rather than merely shadowed.
+        let results = store.search_similar(&[0.0, 1.0, 0.0], 1).unwrap();
+        assert_eq!(results[0].0.id, id);
+        assert_eq!(results[0].0.text, "new text");
+    }
+
+    #[test]
+    fn update_memory_text_on_a_missing_id_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HistoryStore::open(dir.path().join("history.db")).unwrap();
+
+        let err = store
+            .update_memory_text(999, "text", vec![1.0, 0.0], "fake-v1")
+            .unwrap_err();
+        assert!(matches!(err, HistoryError::NotFound { id: 999 }));
+    }
+
+    #[test]
+    fn delete_memory_removes_it_from_both_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HistoryStore::open(dir.path().join("history.db")).unwrap();
+
+        let id = store
+            .insert_memory(new_memory("to delete", vec![1.0, 0.0, 0.0]))
+            .unwrap();
+        let other = store
+            .insert_memory(new_memory("keep me", vec![0.0, 1.0, 0.0]))
+            .unwrap();
+
+        store.delete_memory(id).unwrap();
+
+        assert!(store.get_memory(id).unwrap().is_none());
+        assert!(store.get_memory(other).unwrap().is_some());
+
+        // No longer surfaced by similarity search either — its vector row
+        // is gone, not just its metadata row.
+        let results = store.search_similar(&[1.0, 0.0, 0.0], 10).unwrap();
+        assert!(results.iter().all(|(m, _)| m.id != id));
+    }
+
+    #[test]
+    fn delete_memory_on_a_missing_id_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HistoryStore::open(dir.path().join("history.db")).unwrap();
+
+        let err = store.delete_memory(999).unwrap_err();
+        assert!(matches!(err, HistoryError::NotFound { id: 999 }));
     }
 }

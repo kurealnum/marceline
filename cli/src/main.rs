@@ -10,6 +10,7 @@ use marceline_core::{Device, HealthView, Supervisor, WorkerSpec};
 use tokio::sync::{watch, RwLock};
 
 mod converse;
+mod memory;
 mod say;
 mod say_to_llm;
 mod transcribe;
@@ -43,6 +44,7 @@ fn main() -> ExitCode {
         Some("say-to-llm") => runtime.block_on(run_say_to_llm(&args)),
         Some("converse") => runtime.block_on(run_converse(&args)),
         Some("config") => run_config(&args),
+        Some("memory") => runtime.block_on(memory::run_memory(&args)),
         Some("--help") | Some("-h") => {
             print_usage();
             ExitCode::SUCCESS
@@ -73,17 +75,23 @@ Usage:
   marceline converse                   Run the full wake->listen->think->speak MVP loop
   marceline config get <key>           Print a config value
   marceline config set <key> <value>   Change a config value
+  marceline memory list                List stored long-term memories
+  marceline memory search <query>      Find memories similar to a query
+  marceline memory edit <id> <text>    Replace a memory's text and re-embed it
+  marceline memory forget <id>         Delete a memory by row id
   marceline --version                  Print the version
 
 Settable keys: {keys}
 
 Options:
-  --config <path>   Config file (default {DEFAULT_CONFIG})
-  --soul <path>     SOUL.md path for say-to-llm (default {soul_default})
-  --wav <path>      Wav output path for say (default {wav_default})
-  --socket <path>   Attach to an already-running STT worker instead of
-                    launching one from config (e.g. /tmp/marceline-stt.sock)
-  --verbose         Debug-level logging",
+  --config <path>     Config file (default {DEFAULT_CONFIG})
+  --soul <path>       SOUL.md path for say-to-llm (default {soul_default})
+  --wav <path>        Wav output path for say (default {wav_default})
+  --socket <path>     Attach to an already-running STT worker instead of
+                      launching one from config (e.g. /tmp/marceline-stt.sock)
+  --model-dir <path>  Embedding model directory for memory edit/search
+  --k <n>             Result count for memory search (default 5)
+  --verbose           Debug-level logging",
         keys = SETTABLE_KEYS.join(", "),
         soul_default = say_to_llm::DEFAULT_SOUL,
         wav_default = say::DEFAULT_WAV,

@@ -35,9 +35,10 @@ pub use config::{Config, ConfigError};
 pub use config_edit::ConfigEditError;
 pub use context::recent_context;
 pub use device::Device;
+pub use embedding::{EmbedError, EmbeddingPipeline, MiniLmEmbedder, MINILM_DIM};
 pub use engine::{AudioStream, EngineError};
 pub use gate::{Gate, GateOutput, GateState};
-pub use history::{HistoryError, HistoryStore, NewTurn, TurnRecord};
+pub use history::{HistoryError, HistoryStore, MemoryRecord, NewMemory, NewTurn, TurnRecord};
 pub use llm::{
     compile_system_prompt, ChatEvent, ChatEventStream, ChatRequest, DropOldestTurn, FinishReason,
     LlmEngine, LlmInfo, MemoryEntry, Message, OpenAiCompatibleEngine, Role, SessionGuard,
