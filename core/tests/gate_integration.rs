@@ -21,6 +21,7 @@ fn default_vad_config() -> VadConfig {
         min_utterance_ms: 300,
         max_utterance_ms: 15_000,
         barge_in_confirm_ms: 300,
+        no_speech_timeout_ms: 3_000,
     }
 }
 
@@ -190,6 +191,7 @@ fn min_utterance_ms_discards_a_short_speech_blip() {
         min_utterance_ms: 500,
         max_utterance_ms: 15_000,
         barge_in_confirm_ms: 300,
+        no_speech_timeout_ms: 3_000,
     };
     let mut gate = build_gate_with(&vad_config);
     let empty_preroll = silence_chunk(0);
@@ -243,6 +245,7 @@ fn max_utterance_ms_force_emits_an_overlong_segment() {
         min_utterance_ms: 0,
         max_utterance_ms: 400,
         barge_in_confirm_ms: 300,
+        no_speech_timeout_ms: 3_000,
     };
     let mut gate = build_gate_with(&vad_config);
     let empty_preroll = silence_chunk(0);

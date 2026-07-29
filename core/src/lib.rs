@@ -10,6 +10,7 @@ pub mod ipc;
 pub mod llm;
 pub mod logging;
 pub mod mcp;
+pub mod orchestrator;
 pub mod stt;
 pub mod supervisor;
 pub mod thinking;
@@ -34,6 +35,9 @@ pub use llm::{
     ToolCallRequest, ToolSpec, TrimPolicy, Trust, TurnBuffer,
 };
 pub use mcp::{register_mcp_tools, McpCallOutcome, McpClient, McpError, McpTool, McpToolInfo};
+pub use orchestrator::{
+    ConversationEvent, ConversationState, FailedStage, IllegalTransition, Orchestrator, Stages,
+};
 pub use stt::{
     GrpcSttEngine, SttEngine, SttInfo, SttManager, SttWorkerPaths, SwapError, Transcript,
     TranscriptStream,

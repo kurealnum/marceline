@@ -9,6 +9,11 @@ protobuf>=5.26.1,<6.0dev
 # pulled in by kokoro_backend.py, which worker.py imports lazily.
 numpy>=1.26,<3
 torch==2.4.1
+# kokoro pulls in transformers unpinned; left alone, pip resolves the
+# latest transformers (5.x), which imports torch internals (DTensor) that
+# moved and breaks against torch 2.4.1. Pin to a 4.x known compatible
+# with this torch version.
+transformers>=4.40,<5
 kokoro==0.9.4
 # Kokoro's grapheme-to-phoneme front end for English.
 misaki[en]==0.9.4
