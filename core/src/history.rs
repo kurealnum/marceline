@@ -9,14 +9,52 @@
 //! actor") and funnels every write through it via a channel; readers instead
 //! open their own short-lived connections, which WAL mode allows to proceed
 //! concurrently with the writer without blocking on it.
+//!
+//! EPIC 10.3 extends this same store with a `memories` table (long-term
+//! memory rows) plus a `memories_vec` `vec0` virtual table (the
+//! `sqlite-vec` vector index) rather than opening a second store or a
+//! second write connection: SQLite is still single-writer for the one
+//! shared DB file, so every memory write goes through the very same write
+//! actor as `turns`, via new [`WriteCommand`] variants. See
+//! `crate::memory` for the higher-level embed-then-store/retrieve API built
+//! on top of the low-level methods here, and `crate::embedding` for the
+//! embedding pipeline itself.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc as std_mpsc;
+use std::sync::Once;
 use std::thread;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::llm::Trust;
+
+/// Registers the `sqlite-vec` loadable extension (`vec0` virtual table,
+/// `vec_version()`, etc.) as a SQLite *auto* extension — vendored as C and
+/// compiled with `SQLITE_CORE` (see `core/Cargo.toml`'s comment on the
+/// `sqlite-vec` dependency), so this links it straight into the same
+/// process as `rusqlite`'s bundled SQLite rather than loading a separate
+/// `.so`/`.dylib` at runtime.
+///
+/// `sqlite3_auto_extension` is a process-global registration that affects
+/// every [`Connection`] opened *after* it runs, so this must be called
+/// before the first `Connection::open` anywhere in the process — guarded by
+/// [`Once`] so every call site (the initial validation open, the write
+/// actor's own connection, and every reader) can call it unconditionally
+/// without double-registering.
+fn register_sqlite_vec() {
+    static REGISTER: Once = Once::new();
+    REGISTER.call_once(|| unsafe {
+        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<
+            unsafe extern "C" fn(),
+            unsafe extern "C" fn(
+                *mut rusqlite::ffi::sqlite3,
+                *mut *const std::os::raw::c_char,
+                *const rusqlite::ffi::sqlite3_api_routines,
+            ) -> std::os::raw::c_int,
+        >(sqlite_vec::sqlite3_vec_init)));
+    });
+}
 
 /// Errors from opening or using the history store.
 #[derive(Debug, thiserror::Error)]
@@ -46,6 +84,21 @@ pub enum HistoryError {
     /// dropped mid-request.
     #[error("history write actor is no longer running")]
     WriteActorGone,
+    /// A memory write supplied a vector whose length doesn't match the
+    /// dimension the `memories_vec` index was created with.
+    ///
+    /// The *only* sanctioned way to change dimension is the re-embed
+    /// migration ([`HistoryStore::apply_reembed`]), which rebuilds the
+    /// index from scratch — a plain insert with a mismatched vector would
+    /// otherwise either corrupt the index or silently mix two models'
+    /// vectors in one queryable table (SPEC.md §5.2), so it errors instead.
+    #[error("memory vector has dimension {got}, but the index is {expected}-dimensional; run a re-embed migration to change it")]
+    DimMismatch {
+        /// Dimension the `memories_vec` index currently has.
+        expected: usize,
+        /// Dimension of the vector that was passed in.
+        got: usize,
+    },
 }
 
 /// Where a stored [`TurnRecord`] came from (SPEC.md §5.1).
@@ -141,19 +194,148 @@ const CREATE_TURNS_TABLE: &str = "
     CREATE INDEX IF NOT EXISTS turns_session_id_idx ON turns (session_id, id);
 ";
 
+/// Plain metadata for each long-term memory row (SPEC.md §5.2, EPIC 10.3):
+/// source text, the embedding model that produced its vector, the vector's
+/// dimension, and provenance. The vector itself lives separately in the
+/// `memories_vec` `vec0` virtual table (created lazily — see
+/// [`ensure_vec_table`]), keyed by the same rowid as `memories.id`, since
+/// `vec0` cannot mix vector storage with ordinary columns in one table.
+const CREATE_MEMORIES_TABLE: &str = "
+    CREATE TABLE IF NOT EXISTS memories (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        text          TEXT    NOT NULL,
+        embed_model   TEXT    NOT NULL,
+        dim           INTEGER NOT NULL,
+        provenance    TEXT    NOT NULL,
+        created_at_ms INTEGER NOT NULL
+    );
+";
+
 /// Opens `path` (creating it and its parent directory if needed), enables
-/// WAL mode, and creates the `turns` table if absent.
+/// WAL mode, registers the `sqlite-vec` extension, and creates the `turns`
+/// and `memories` tables if absent.
 ///
 /// WAL mode is a per-database-file setting that persists once written, but
 /// every connection this module opens (write actor and each reader) sets it
 /// again on connect anyway — cheap, and it means store setup never depends
 /// on which connection happens to run first.
+///
+/// `memories_vec` (the `vec0` index) is deliberately *not* created here:
+/// its column dimension is fixed at creation time and depends on the
+/// configured embedding model, which this function doesn't know about. See
+/// [`ensure_vec_table`].
 fn open_and_prepare(path: &Path) -> Result<Connection, rusqlite::Error> {
+    register_sqlite_vec();
     let conn = Connection::open(path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "busy_timeout", 5_000)?;
     conn.execute_batch(CREATE_TURNS_TABLE)?;
+    conn.execute_batch(CREATE_MEMORIES_TABLE)?;
     Ok(conn)
+}
+
+/// Returns the `vec0` column dimension `memories_vec` currently has, or
+/// `None` if the table doesn't exist yet (no memory has ever been written).
+///
+/// `vec0` has no `PRAGMA table_info` support, so this recovers the
+/// dimension the blunt way: the table's own `CREATE VIRTUAL TABLE` text
+/// (as SQLite stored it in `sqlite_master`) always contains `float[N]`.
+fn existing_vec_dim(conn: &Connection) -> Result<Option<usize>, rusqlite::Error> {
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'memories_vec'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(sql) = sql else {
+        return Ok(None);
+    };
+    let dim = sql
+        .split("float[")
+        .nth(1)
+        .and_then(|rest| rest.split(']').next())
+        .and_then(|n| n.parse::<usize>().ok());
+    Ok(dim)
+}
+
+/// Ensures `memories_vec` exists with exactly `dim` dimensions, creating it
+/// on first use. Returns [`HistoryError::DimMismatch`] if it already exists
+/// with a *different* dimension — normal writes must match the
+/// already-established dimension; only [`HistoryStore::apply_reembed`] is
+/// allowed to change it, by dropping and recreating the table itself.
+fn ensure_vec_table(conn: &Connection, dim: usize) -> Result<(), HistoryError> {
+    match existing_vec_dim(conn)? {
+        Some(existing) if existing != dim => Err(HistoryError::DimMismatch {
+            expected: existing,
+            got: dim,
+        }),
+        Some(_) => Ok(()),
+        None => {
+            conn.execute_batch(&format!(
+                "CREATE VIRTUAL TABLE memories_vec USING vec0(embedding float[{dim}]);"
+            ))?;
+            Ok(())
+        }
+    }
+}
+
+/// A memory to be persisted (SPEC.md §5.2, EPIC 10.3), handed to the write
+/// actor once `crate::memory` has computed its embedding.
+///
+/// Carries an already-computed `vector` rather than raw text: embedding is
+/// CPU-bound model inference and does not belong on the write actor thread,
+/// which must stay free to service `turns` writes too.
+#[derive(Debug, Clone)]
+pub struct NewMemory {
+    /// Source text the memory was derived from — kept verbatim so a
+    /// re-embed migration can recompute the vector later without needing
+    /// the original conversation.
+    pub text: String,
+    /// Identifies the model that produced `vector` (SPEC.md §5.2).
+    pub embed_model: String,
+    /// The embedding vector. Its length becomes (or must match) the
+    /// `memories_vec` index's dimension.
+    pub vector: Vec<f32>,
+    /// Provenance taint (§5.1) — preserved from the source turn(s).
+    pub provenance: Trust,
+    /// Unix epoch milliseconds when the memory was created.
+    pub created_at_ms: i64,
+}
+
+/// A memory as read back from the database (without its vector — callers
+/// doing similarity search get distances from [`HistoryStore::search_similar`]
+/// instead of the raw vector, and plain listing never needs it).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryRecord {
+    /// Row id, shared with `memories_vec`'s rowid.
+    pub id: i64,
+    /// Source text.
+    pub text: String,
+    /// Embedding model id that produced the stored vector.
+    pub embed_model: String,
+    /// Vector dimension.
+    pub dim: usize,
+    /// Provenance taint (§5.1).
+    pub provenance: Trust,
+    /// Unix epoch milliseconds when the memory was created.
+    pub created_at_ms: i64,
+}
+
+fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<MemoryRecord> {
+    let provenance_str: String = row.get(4)?;
+    Ok(MemoryRecord {
+        id: row.get(0)?,
+        text: row.get(1)?,
+        embed_model: row.get(2)?,
+        dim: row.get::<_, i64>(3)? as usize,
+        provenance: provenance_from_str(&provenance_str)?,
+        created_at_ms: row.get(5)?,
+    })
+}
+
+fn vector_to_blob(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
 
 /// A command sent to the write actor thread.
@@ -161,6 +343,21 @@ enum WriteCommand {
     LogTurn {
         turn: NewTurn,
         reply: std_mpsc::SyncSender<Result<i64, HistoryError>>,
+    },
+    InsertMemory {
+        memory: NewMemory,
+        reply: std_mpsc::SyncSender<Result<i64, HistoryError>>,
+    },
+    /// Atomically swaps every memory's vector (and `embed_model`/`dim`) for
+    /// ones recomputed under a new model — the re-embed migration (SPEC.md
+    /// §5.2, EPIC 10.3). Rebuilds `memories_vec` from scratch inside one
+    /// transaction so no reader ever observes a mix of old- and new-model
+    /// vectors.
+    ReembedMemories {
+        model_id: String,
+        dim: usize,
+        vectors: Vec<(i64, Vec<f32>)>,
+        reply: std_mpsc::SyncSender<Result<usize, HistoryError>>,
     },
 }
 
@@ -228,6 +425,60 @@ impl HistoryStore {
                             )
                             .map(|_| conn.last_insert_rowid())
                             .map_err(HistoryError::from);
+                        let _ = reply.send(result);
+                    }
+                    WriteCommand::InsertMemory { memory, reply } => {
+                        let result = (|| -> Result<i64, HistoryError> {
+                            let dim = memory.vector.len();
+                            ensure_vec_table(&conn, dim)?;
+                            let tx = conn.unchecked_transaction()?;
+                            tx.execute(
+                                "INSERT INTO memories
+                                    (text, embed_model, dim, provenance, created_at_ms)
+                                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                                params![
+                                    memory.text,
+                                    memory.embed_model,
+                                    dim as i64,
+                                    provenance_to_str(memory.provenance),
+                                    memory.created_at_ms,
+                                ],
+                            )?;
+                            let id = tx.last_insert_rowid();
+                            tx.execute(
+                                "INSERT INTO memories_vec (rowid, embedding) VALUES (?1, ?2)",
+                                params![id, vector_to_blob(&memory.vector)],
+                            )?;
+                            tx.commit()?;
+                            Ok(id)
+                        })();
+                        let _ = reply.send(result);
+                    }
+                    WriteCommand::ReembedMemories {
+                        model_id,
+                        dim,
+                        vectors,
+                        reply,
+                    } => {
+                        let result = (|| -> Result<usize, HistoryError> {
+                            let tx = conn.unchecked_transaction()?;
+                            tx.execute_batch("DROP TABLE IF EXISTS memories_vec;")?;
+                            tx.execute_batch(&format!(
+                                "CREATE VIRTUAL TABLE memories_vec USING vec0(embedding float[{dim}]);"
+                            ))?;
+                            for (id, vector) in &vectors {
+                                tx.execute(
+                                    "UPDATE memories SET embed_model = ?1, dim = ?2 WHERE id = ?3",
+                                    params![model_id, dim as i64, id],
+                                )?;
+                                tx.execute(
+                                    "INSERT INTO memories_vec (rowid, embedding) VALUES (?1, ?2)",
+                                    params![id, vector_to_blob(vector)],
+                                )?;
+                            }
+                            tx.commit()?;
+                            Ok(vectors.len())
+                        })();
                         let _ = reply.send(result);
                     }
                 }
@@ -298,6 +549,141 @@ impl HistoryStore {
         .optional()
         .map_err(HistoryError::from)
     }
+
+    /// Persists an already-embedded memory via the write actor, returning
+    /// its row id (SPEC.md §5.2, EPIC 10.3).
+    ///
+    /// `crate::memory::store_memory` is the usual entry point (it computes
+    /// `memory.vector` first); this is the low-level primitive that
+    /// actually writes it, alongside `turns`, through the single write
+    /// actor.
+    pub fn insert_memory(&self, memory: NewMemory) -> Result<i64, HistoryError> {
+        let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
+        self.write_tx
+            .send(WriteCommand::InsertMemory {
+                memory,
+                reply: reply_tx,
+            })
+            .map_err(|_| HistoryError::WriteActorGone)?;
+        reply_rx.recv().map_err(|_| HistoryError::WriteActorGone)?
+    }
+
+    /// Reads every memory row, oldest first. Used for listing and as the
+    /// source-text pass of a re-embed migration.
+    pub fn all_memories(&self) -> Result<Vec<MemoryRecord>, HistoryError> {
+        let conn = open_and_prepare(&self.db_path).map_err(|source| HistoryError::Open {
+            path: self.db_path.clone(),
+            source,
+        })?;
+        let mut stmt = conn.prepare(
+            "SELECT id, text, embed_model, dim, provenance, created_at_ms
+             FROM memories ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map([], row_to_memory)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Reads a single memory by row id, if it exists.
+    pub fn get_memory(&self, id: i64) -> Result<Option<MemoryRecord>, HistoryError> {
+        let conn = open_and_prepare(&self.db_path).map_err(|source| HistoryError::Open {
+            path: self.db_path.clone(),
+            source,
+        })?;
+        conn.query_row(
+            "SELECT id, text, embed_model, dim, provenance, created_at_ms
+             FROM memories WHERE id = ?1",
+            params![id],
+            row_to_memory,
+        )
+        .optional()
+        .map_err(HistoryError::from)
+    }
+
+    /// Distinct `embed_model` ids currently stored across all memories.
+    ///
+    /// Empty if there are no memories yet. A non-empty result containing
+    /// anything other than the currently configured model id is the signal
+    /// that a re-embed migration is due (SPEC.md §5.2) — see
+    /// `crate::memory::ensure_current_embed_model`.
+    pub fn distinct_embed_models(&self) -> Result<Vec<String>, HistoryError> {
+        let conn = open_and_prepare(&self.db_path).map_err(|source| HistoryError::Open {
+            path: self.db_path.clone(),
+            source,
+        })?;
+        let mut stmt = conn.prepare("SELECT DISTINCT embed_model FROM memories")?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Finds the `k` memories whose stored vectors are nearest `query` (by
+    /// `vec0`'s default Euclidean distance — vectors are expected to be
+    /// L2-normalized by the embedding pipeline, which makes nearest-by-L2
+    /// and nearest-by-cosine agree), nearest first.
+    ///
+    /// Returns an empty result if no memory has ever been written (the
+    /// `memories_vec` index doesn't exist yet), rather than erroring —
+    /// "no memories" is a normal, expected state, not a failure.
+    pub fn search_similar(
+        &self,
+        query: &[f32],
+        k: usize,
+    ) -> Result<Vec<(MemoryRecord, f64)>, HistoryError> {
+        let conn = open_and_prepare(&self.db_path).map_err(|source| HistoryError::Open {
+            path: self.db_path.clone(),
+            source,
+        })?;
+        if existing_vec_dim(&conn)?.is_none() {
+            return Ok(Vec::new());
+        }
+
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.text, m.embed_model, m.dim, m.provenance, m.created_at_ms, v.distance
+             FROM memories_vec v
+             JOIN memories m ON m.id = v.rowid
+             WHERE v.embedding MATCH ?1 AND k = ?2
+             ORDER BY v.distance",
+        )?;
+        let rows = stmt
+            .query_map(params![vector_to_blob(query), k as i64], |row| {
+                Ok((row_to_memory(row)?, row.get::<_, f64>(6)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Atomically re-embeds every memory (SPEC.md §5.2, EPIC 10.3):
+    /// `vectors` must already contain the freshly-recomputed vector for
+    /// every existing memory id, keyed under the new model's id and
+    /// dimension. Rebuilds `memories_vec` from scratch in one transaction
+    /// on the write actor, so no reader ever sees a mix of old- and
+    /// new-model vectors — the table simply doesn't exist for the instant
+    /// between drop and recreate, and readers treat "doesn't exist yet" as
+    /// "no memories" rather than an error.
+    ///
+    /// Low-level: `crate::memory::reembed_all` is the usual entry point —
+    /// it reads `all_memories`, calls the new pipeline for each, and hands
+    /// the results here.
+    pub fn apply_reembed(
+        &self,
+        model_id: &str,
+        dim: usize,
+        vectors: Vec<(i64, Vec<f32>)>,
+    ) -> Result<usize, HistoryError> {
+        let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
+        self.write_tx
+            .send(WriteCommand::ReembedMemories {
+                model_id: model_id.to_string(),
+                dim,
+                vectors,
+                reply: reply_tx,
+            })
+            .map_err(|_| HistoryError::WriteActorGone)?;
+        reply_rx.recv().map_err(|_| HistoryError::WriteActorGone)?
+    }
 }
 
 #[cfg(test)]
@@ -336,7 +722,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = HistoryStore::open(dir.path().join("history.db")).unwrap();
 
-        store.log_turn(turn("s1", "user", "first", Trust::User)).unwrap();
+        store
+            .log_turn(turn("s1", "user", "first", Trust::User))
+            .unwrap();
         store
             .log_turn(turn("s1", "assistant", "second", Trust::Assistant))
             .unwrap();
@@ -399,7 +787,9 @@ mod tests {
 
         {
             let store = HistoryStore::open(&db_path).unwrap();
-            store.log_turn(turn("s1", "user", "before restart", Trust::User)).unwrap();
+            store
+                .log_turn(turn("s1", "user", "before restart", Trust::User))
+                .unwrap();
         }
 
         let store = HistoryStore::open(&db_path).unwrap();
