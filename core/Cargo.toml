@@ -36,6 +36,22 @@ serde_json = "1"
 bytes = "1"
 # Bundled so the daemon doesn't depend on a system libsqlite3 install.
 rusqlite = { version = "0.31", features = ["bundled"] }
+# Long-term memory vector index (EPIC 10.3): the `vec0` virtual table,
+# vendored as C and compiled with `SQLITE_CORE` so it links straight into
+# the same process as `rusqlite`'s bundled SQLite — no separate loadable
+# `.so`/`.dylib` to ship or `load_extension` dance at runtime. Pinned off
+# the `-alpha` track: 0.1.10-alpha.4 ships a C file that `#include`s a
+# sibling `sqlite-vec-diskann.c` the crate forgets to package, so it fails
+# to compile at all; 0.1.9 is the latest release that actually builds.
+sqlite-vec = "0.1.9"
+# Local CPU tokenizer for the `all-MiniLM-L6-v2` embedding pipeline (EPIC
+# 10.3), matching the model's own WordPiece vocabulary/tokenizer.json.
+# The `onig` feature is required, not optional, despite `default-features
+# = false`: 0.20.4's `utils/onig.rs` module references the `onig` crate
+# unconditionally (not behind `cfg(feature = "onig")`), so the crate fails
+# to compile at all without it. `onig_sys` vendors its own oniguruma C
+# source, so this still builds fully offline via `cc`.
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 
 [dev-dependencies]
 # The STT client tests run a fake `Stt` server over a real unix socket,
