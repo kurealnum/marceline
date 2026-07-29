@@ -32,6 +32,7 @@ fn main() {
         silence_ms: 700,
         min_utterance_ms: 300,
         max_utterance_ms: 15_000,
+        barge_in_confirm_ms: 300,
     };
     let mut gate = Gate::new(wake, endpointer, &vad_config);
 
@@ -63,6 +64,7 @@ fn main() {
                 segment_written = true;
             }
             GateOutput::TooShort => println!("(utterance discarded: too short)"),
+            GateOutput::WakeDetected => println!("(wake detected during THINKING/SPEAKING)"),
             GateOutput::None => {}
         }
     }

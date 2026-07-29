@@ -54,6 +54,7 @@ fn build_gate() -> Gate {
         silence_ms: 700,
         min_utterance_ms: 300,
         max_utterance_ms: 15_000,
+        barge_in_confirm_ms: 300,
     };
     let wake_config = WakeConfig {
         words: vec!["marceline".to_string()],

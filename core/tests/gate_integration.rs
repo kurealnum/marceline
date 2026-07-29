@@ -20,6 +20,7 @@ fn default_vad_config() -> VadConfig {
         silence_ms: 700,
         min_utterance_ms: 300,
         max_utterance_ms: 15_000,
+        barge_in_confirm_ms: 300,
     }
 }
 
@@ -113,6 +114,7 @@ fn wake_then_speech_then_silence_emits_one_segment_seeded_with_preroll() {
             GateOutput::NoSpeechTimeout => panic!("should not time out mid-speech"),
             GateOutput::TooShort => panic!("continuous phrase should not be discarded as too short"),
             GateOutput::Wake => panic!("should not re-fire wake while listening"),
+            GateOutput::WakeDetected => panic!("WakeDetected only fires in THINKING/SPEAKING"),
         }
     }
     assert_eq!(segments_during_speech, 0, "must not emit before trailing silence");
@@ -172,6 +174,7 @@ fn wake_with_no_following_speech_times_out_back_to_idle() {
             GateOutput::TooShort => panic!("no speech was ever heard; TooShort shouldn't fire"),
             GateOutput::None => {}
             GateOutput::Wake => panic!("should not re-fire wake while listening"),
+            GateOutput::WakeDetected => panic!("WakeDetected only fires in THINKING/SPEAKING"),
         }
     }
     assert!(timed_out, "expected a no-speech timeout");
@@ -186,6 +189,7 @@ fn min_utterance_ms_discards_a_short_speech_blip() {
         silence_ms: 200,
         min_utterance_ms: 500,
         max_utterance_ms: 15_000,
+        barge_in_confirm_ms: 300,
     };
     let mut gate = build_gate_with(&vad_config);
     let empty_preroll = silence_chunk(0);
@@ -238,6 +242,7 @@ fn max_utterance_ms_force_emits_an_overlong_segment() {
         silence_ms: 700,
         min_utterance_ms: 0,
         max_utterance_ms: 400,
+        barge_in_confirm_ms: 300,
     };
     let mut gate = build_gate_with(&vad_config);
     let empty_preroll = silence_chunk(0);
@@ -267,5 +272,59 @@ fn max_utterance_ms_force_emits_an_overlong_segment() {
         }
     }
     assert!(emitted, "expected max_utterance_ms to force an emission");
+    assert_eq!(gate.state(), GateState::Idle);
+}
+
+#[test]
+fn wake_detector_stays_armed_through_thinking_and_speaking() {
+    // EPIC 7.1: the gate must not go deaf the moment a turn leaves
+    // IDLE/LISTENING. Verify the wake detector keeps firing in THINKING
+    // and SPEAKING, without collecting an utterance or touching state.
+    let mut gate = build_gate();
+    let empty_preroll = silence_chunk(0);
+
+    gate.enter_thinking();
+    assert_eq!(gate.state(), GateState::Thinking);
+    let mut fired = false;
+    for _ in 0..20 {
+        match gate.process_chunk(&loud_tone_chunk(320), &empty_preroll) {
+            GateOutput::WakeDetected => {
+                fired = true;
+                break;
+            }
+            GateOutput::None => {}
+            other => panic!("unexpected output while THINKING: {other:?}"),
+        }
+    }
+    assert!(fired, "wake detector must still fire while THINKING");
+    assert_eq!(
+        gate.state(),
+        GateState::Thinking,
+        "a bare detection must not itself change state"
+    );
+
+    // Clear the wake detector's cooldown (EPIC 2.1) before expecting it
+    // to fire again.
+    for _ in 0..100 {
+        gate.process_chunk(&silence_chunk(320), &empty_preroll);
+    }
+
+    gate.enter_speaking();
+    assert_eq!(gate.state(), GateState::Speaking);
+    let mut fired = false;
+    for _ in 0..20 {
+        match gate.process_chunk(&loud_tone_chunk(320), &empty_preroll) {
+            GateOutput::WakeDetected => {
+                fired = true;
+                break;
+            }
+            GateOutput::None => {}
+            other => panic!("unexpected output while SPEAKING: {other:?}"),
+        }
+    }
+    assert!(fired, "wake detector must still fire while SPEAKING");
+    assert_eq!(gate.state(), GateState::Speaking);
+
+    gate.enter_idle();
     assert_eq!(gate.state(), GateState::Idle);
 }
