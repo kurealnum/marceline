@@ -18,10 +18,22 @@
 //!
 //! No tools, no memory, no barge-in yet (out of scope per the issue) — one
 //! provider per stage, exactly the MVP bar.
+//!
+//! **Cancellation (EPIC 8.4, SPEC.md §2.5.1):** one run [`CancellationToken`]
+//! per turn, minted the moment `WakeWord` fires, is what every stage's
+//! client connection for that turn is built with. STT and TTS workers stay
+//! up across turns (relaunching the model per turn would be absurd), but
+//! each turn opens a *fresh client connection* to the already-running
+//! worker carrying that turn's token — cheap (a socket connect, not a
+//! model load) and it's what lets firing the token actually reach a
+//! specific turn's in-flight gRPC call rather than being fixed at
+//! worker-launch time. `ctrl-c` fires whatever turn is currently in
+//! flight (or exits immediately if idle) — the same path barge-in (EPIC 7)
+//! will fire later.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -31,13 +43,19 @@ use marceline_core::transcribe::{TranscribeOutcome, DEFAULT_TIMEOUT};
 use marceline_core::tts::TtsWorkerPaths;
 use marceline_core::{
     compile_system_prompt, sentence_chunk, ChatRequest, Config, ConversationEvent,
-    EnergyWakeDetector, FailedStage, Gate, GateOutput, HealthView, LlmEngine, Message,
-    OpenAiCompatibleEngine, Orchestrator, Playback, Role, SileroVad, SttManager, Stages, TtsEngine,
-    VadEndpointer, VoiceId, DEFAULT_SPEECH_THRESHOLD,
+    EnergyWakeDetector, FailedStage, Gate, GateOutput, GrpcTtsEngine, HealthView, LlmEngine,
+    Message, OpenAiCompatibleEngine, Orchestrator, Playback, Role, SileroVad, SttManager, Stages,
+    TtsEngine, VadEndpointer, VoiceId, DEFAULT_SPEECH_THRESHOLD,
 };
 use marceline_core::audio::Capture;
 use tokio::sync::{watch, RwLock};
 use tokio_util::sync::CancellationToken;
+
+/// The one run token currently in flight, shared with the `ctrl-c`
+/// watcher (EPIC 8.4, §2.5.1) — `None` while `IDLE`. A plain `std::sync`
+/// mutex is enough: it is only ever held for the instant it takes to
+/// clone or replace the token, never across an `.await`.
+type CurrentRun = Arc<Mutex<Option<CancellationToken>>>;
 
 /// Anything that can go wrong running the full conversation loop.
 #[derive(Debug, thiserror::Error)]
@@ -69,12 +87,17 @@ const GRACEFUL_ERROR_MESSAGE: &str = "Sorry, I ran into a problem with that. Ple
 /// stage work runs in [`converse`]'s driving loop instead (see module
 /// docs for why — `THINKING -> SPEAKING` fires mid-stage, not at entry).
 ///
-/// On error, speaks [`GRACEFUL_ERROR_MESSAGE`] through the same TTS
-/// engine/playback the happy path uses — unless the failed stage *is*
-/// TTS, in which case no spoken message is possible and this only logs
+/// On error, speaks [`GRACEFUL_ERROR_MESSAGE`] through a fresh connection
+/// to the already-running TTS worker — unless the failed stage *is* TTS,
+/// in which case no spoken message is possible and this only logs
 /// (§9.11's accepted exception).
+///
+/// A *fresh* connection, not the turn's own (now-cancelled or faulted)
+/// one: that token is either already fired or belongs to the stage that
+/// just failed, and reusing it here would make the graceful message
+/// cancel itself before a single chunk plays.
 struct ErrorSpeaker<'a> {
-    tts: &'a dyn TtsEngine,
+    tts_socket: &'a Path,
     playback: &'a Playback,
     voice: &'a VoiceId,
 }
@@ -94,10 +117,17 @@ impl<'a> Stages for ErrorSpeaker<'a> {
             return;
         }
 
+        let tts = match GrpcTtsEngine::connect(self.tts_socket, CancellationToken::new()).await {
+            Ok(tts) => tts,
+            Err(err) => {
+                tracing::error!(%err, "could not reach tts worker to speak graceful error message");
+                return;
+            }
+        };
         let text_stream: marceline_core::TextStream = Box::pin(futures::stream::once(async {
             Ok(GRACEFUL_ERROR_MESSAGE.to_string())
         }));
-        let mut audio = self.tts.synthesize(text_stream, self.voice.clone()).await;
+        let mut audio = tts.synthesize(text_stream, self.voice.clone()).await;
         while let Some(chunk) = audio.next().await {
             match chunk {
                 Ok(chunk) => self.playback.push(&chunk),
@@ -139,24 +169,32 @@ pub async fn converse(config_path: &Path, soul_path: &Path) -> Result<(), Conver
 
     let playback = Playback::start(config.audio.output_device.as_deref())?;
 
-    // Workers are launched once and reused across every turn; held here so
-    // the shutdown senders outlive the whole loop and stop them on return.
+    // Workers are launched once and stay up across every turn (relaunching
+    // the model per turn would be absurd); each turn instead opens its own
+    // client connection to these sockets, carrying that turn's own
+    // cancellation token (see module docs, EPIC 8.4). The `SttManager`/
+    // engine values returned here exist only to prove the worker came up —
+    // no further calls go through them.
+    let stt_paths = SttWorkerPaths::for_backend(&config.stt.backend);
+    let stt_socket = stt_paths.socket_path.clone();
     let (stt_shutdown_tx, stt_shutdown_rx) = watch::channel(false);
     let stt_health: HealthView = Arc::new(RwLock::new(HashMap::new()));
-    let stt = SttManager::start(
+    let _stt_launch = SttManager::start(
         &config.stt,
-        SttWorkerPaths::for_backend(&config.stt.backend),
+        stt_paths,
         stt_health,
         stt_shutdown_rx,
         CancellationToken::new(),
     )
     .await?;
 
+    let tts_paths = TtsWorkerPaths::for_backend(&config.tts.backend);
+    let tts_socket = tts_paths.socket_path.clone();
     let (tts_shutdown_tx, tts_shutdown_rx) = watch::channel(false);
     let tts_health: HealthView = Arc::new(RwLock::new(HashMap::new()));
-    let tts = marceline_core::launch_tts_worker(
+    let _tts_launch = marceline_core::launch_tts_worker(
         &config.tts,
-        TtsWorkerPaths::for_backend(&config.tts.backend),
+        tts_paths,
         tts_health,
         tts_shutdown_rx,
         CancellationToken::new(),
@@ -164,15 +202,37 @@ pub async fn converse(config_path: &Path, soul_path: &Path) -> Result<(), Conver
     .await?;
     let voice = VoiceId::from(config.tts.voice.as_str());
 
+    // Fired by the `ctrl-c` watcher below and set/cleared by the loop as
+    // turns start and finish — the one shared handle onto "the run
+    // currently in flight" (§2.5.1).
+    let current_run: CurrentRun = Arc::new(Mutex::new(None));
+    let ctrlc_run = Arc::clone(&current_run);
+    tokio::spawn(async move {
+        loop {
+            if tokio::signal::ctrl_c().await.is_err() {
+                return;
+            }
+            match ctrlc_run.lock().expect("current_run lock poisoned").clone() {
+                // A turn is in flight: cancel it (same path barge-in will
+                // ride, EPIC 7) rather than killing the process outright.
+                Some(token) => token.cancel(),
+                // Idle: nothing to cancel, so ctrl-c means "exit".
+                None => std::process::exit(0),
+            }
+        }
+    });
+
     let result = run_loop(
         &mut gate,
         &capture,
         &playback,
-        &stt,
-        &tts,
+        &stt_socket,
+        &tts_socket,
+        &config.stt.lang,
         &voice,
         &config,
         &system_prompt,
+        &current_run,
     )
     .await;
 
@@ -188,24 +248,28 @@ async fn run_loop(
     gate: &mut Gate,
     capture: &Capture,
     playback: &Playback,
-    stt: &SttManager,
-    tts: &dyn TtsEngine,
+    stt_socket: &Path,
+    tts_socket: &Path,
+    lang: &str,
     voice: &VoiceId,
     config: &Config,
     system_prompt: &str,
+    current_run: &CurrentRun,
 ) -> Result<(), ConverseError> {
-    let llm = OpenAiCompatibleEngine::new(&config.llm, CancellationToken::new())?;
     let transcribe_timeout = Duration::from_millis(config.orchestrator.transcribe_timeout_ms);
     let think_timeout = Duration::from_millis(config.orchestrator.think_timeout_ms);
     let speak_timeout = Duration::from_millis(config.orchestrator.speak_timeout_ms);
     let mut orchestrator = Orchestrator::new(ErrorSpeaker {
-        tts,
+        tts_socket,
         playback,
         voice,
     });
 
     'turn: loop {
-        // IDLE: poll the mic for the wake word.
+        // IDLE: poll the mic for the wake word. No run token exists yet —
+        // clear the shared slot so a stray ctrl-c while idle just exits
+        // (handled by the watcher) instead of cancelling nothing.
+        *current_run.lock().expect("current_run lock poisoned") = None;
         loop {
             let Ok(chunk) = capture.chunks().recv_timeout(WAKE_POLL_TIMEOUT) else {
                 continue;
@@ -219,6 +283,48 @@ async fn run_loop(
                 break;
             }
         }
+
+        // One run token for the whole turn (§2.5.1): minted by `apply`
+        // above, published here so `ctrl-c` can reach it, and cloned into
+        // every stage's client connection below.
+        let run_token = orchestrator
+            .run_token()
+            .expect("Listening always has a run token")
+            .clone();
+        *current_run.lock().expect("current_run lock poisoned") = Some(run_token.clone());
+
+        let stt = match SttManager::attach(stt_socket.to_path_buf(), run_token.clone(), lang.to_string())
+            .await
+        {
+            Ok(stt) => stt,
+            Err(err) => {
+                let _ = orchestrator
+                    .apply(ConversationEvent::StageError {
+                        stage: FailedStage::Stt,
+                        reason: err.to_string(),
+                    })
+                    .await;
+                let _ = orchestrator.apply(ConversationEvent::ErrorHandled).await;
+                continue 'turn;
+            }
+        };
+        let tts = match GrpcTtsEngine::connect(tts_socket, run_token.clone()).await {
+            Ok(tts) => tts,
+            Err(err) => {
+                let _ = orchestrator
+                    .apply(ConversationEvent::StageError {
+                        stage: FailedStage::Tts,
+                        reason: err.to_string(),
+                    })
+                    .await;
+                let _ = orchestrator.apply(ConversationEvent::ErrorHandled).await;
+                continue 'turn;
+            }
+        };
+        // Cheap to build per turn: no persistent connection, just an HTTP
+        // client config, so it carries this turn's own token rather than
+        // one fixed for the process lifetime.
+        let llm = OpenAiCompatibleEngine::new(&config.llm, run_token.clone())?;
 
         // LISTENING: collect the utterance. The gate's own no-speech
         // timeout (`[vad].no_speech_timeout_ms`, EPIC 8.3) covers the
@@ -398,10 +504,23 @@ async fn run_loop(
             .await
             .expect("Thinking always accepts FirstTtsChunk");
         playback.push(&first_chunk);
+        let mut cancelled = false;
         while let Some(chunk) = audio.next().await {
             match chunk {
                 Ok(chunk) => playback.push(&chunk),
                 Err(err) => {
+                    // A cancel (ctrl-c/barge-in) surfaces here as a stream
+                    // error (§2.5.1) — flush rather than waiting for the
+                    // ring to drain, or Marceline talks over the user for
+                    // the length of whatever was already buffered.
+                    cancelled = run_token.is_cancelled();
+                    if cancelled {
+                        // Partial-state policy (§2.5.1): until EPIC 10's
+                        // history store exists, marking the turn
+                        // `interrupted` means logging it — there is
+                        // nowhere else to record it yet.
+                        tracing::info!(interrupted = true, "turn cancelled mid-speech");
+                    }
                     let _ = orchestrator
                         .apply(ConversationEvent::StageError {
                             stage: FailedStage::Tts,
@@ -413,8 +532,12 @@ async fn run_loop(
                 }
             }
         }
-        while playback.buffered_samples() > 0 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        if cancelled {
+            playback.flush();
+        } else {
+            while playback.buffered_samples() > 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
         }
 
         orchestrator
