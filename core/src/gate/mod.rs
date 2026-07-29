@@ -3,6 +3,13 @@
 //! always-on mic frames into clean, bounded audio segments the
 //! orchestrator (EPIC 8) and STT (EPIC 3) consume directly.
 //!
+//! `THINKING`/`SPEAKING` (EPIC 7.1) are orchestrator-driven states entered
+//! via `enter_thinking`/`enter_speaking`: the gate keeps running the wake
+//! detector on every frame so it never goes deaf mid-turn, but doesn't
+//! collect an utterance or run VAD/STT until back in IDLE/LISTENING. A
+//! wake detection in these states is surfaced as `GateOutput::WakeDetected`
+//! for EPIC 7.2 to act on later; this story only keeps the gate listening.
+//!
 //! Utterance capture is seeded from the capture pre-roll ring (§2.6): the
 //! wake-firing chunk is prepended with whatever the pre-roll already
 //! holds, so a same-breath command isn't lost to the ~300ms IDLE ->
@@ -34,6 +41,14 @@ pub enum GateState {
     Idle,
     /// Collecting an utterance following a wake event.
     Listening,
+    /// Orchestrator (EPIC 8) is running the LLM turn; the gate stays
+    /// armed and keeps running the wake detector on every frame (EPIC
+    /// 7.1), but does not collect an utterance or run VAD/STT.
+    Thinking,
+    /// TTS is playing back the reply; the gate stays armed and keeps
+    /// running the wake detector on every frame (EPIC 7.1) so a
+    /// same-breath wake word can barge in (EPIC 7.2). No VAD/STT here.
+    Speaking,
 }
 
 /// What happened as a result of feeding one chunk to the gate.
@@ -53,6 +68,10 @@ pub enum GateOutput {
     /// silence-triggered end) was shorter than `min_utterance_ms` — too
     /// short to be real speech. Discarded; the gate returned to IDLE.
     TooShort,
+    /// A wake word fired while the gate was THINKING or SPEAKING (EPIC
+    /// 7.1). This story only surfaces the detection for 7.2 to consume
+    /// later; it does not itself collect an utterance or change state.
+    WakeDetected,
 }
 
 /// The gate state machine: wake detection plus VAD-driven utterance
@@ -113,6 +132,28 @@ impl Gate {
         self.state
     }
 
+    /// Called by the orchestrator (EPIC 8) when the LLM turn starts, so
+    /// the gate keeps running the wake detector instead of sitting idle
+    /// (EPIC 7.1). Does not touch the capture/ring-buffer path — those
+    /// keep feeding `process_chunk` exactly as they do in IDLE/LISTENING.
+    pub fn enter_thinking(&mut self) {
+        self.state = GateState::Thinking;
+    }
+
+    /// Called by the orchestrator (EPIC 8) when TTS playback starts, so
+    /// the gate keeps running the wake detector during playback (EPIC
+    /// 7.1) as the precondition for barge-in (EPIC 7.2).
+    pub fn enter_speaking(&mut self) {
+        self.state = GateState::Speaking;
+    }
+
+    /// Called by the orchestrator (EPIC 8) when a turn completes
+    /// (THINKING/SPEAKING done, no barge-in fired) to return the gate to
+    /// its normal wake-from-IDLE behavior.
+    pub fn enter_idle(&mut self) {
+        self.state = GateState::Idle;
+    }
+
     /// Feeds one capture-rate chunk through the gate. `preroll` is the
     /// capture's current pre-roll snapshot (SPEC.md §2.6) — only consulted
     /// when a wake event fires this call, to seed the utterance buffer.
@@ -120,6 +161,20 @@ impl Gate {
         match self.state {
             GateState::Idle => self.process_idle(chunk, preroll),
             GateState::Listening => self.process_listening(chunk),
+            GateState::Thinking | GateState::Speaking => self.process_armed_background(chunk),
+        }
+    }
+
+    /// THINKING/SPEAKING background pass (EPIC 7.1): keeps the wake
+    /// detector running on every frame so the gate never goes deaf during
+    /// a turn, but does not collect an utterance or run VAD/STT — those
+    /// stay LISTENING-only. A detection here is surfaced to the caller
+    /// (EPIC 7.2 will act on it); this story does not.
+    fn process_armed_background(&mut self, chunk: &AudioChunk) -> GateOutput {
+        if self.wake.process_chunk(chunk).is_some() {
+            GateOutput::WakeDetected
+        } else {
+            GateOutput::None
         }
     }
 

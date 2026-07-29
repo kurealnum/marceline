@@ -63,6 +63,7 @@ fn main() {
                 segment_written = true;
             }
             GateOutput::TooShort => println!("(utterance discarded: too short)"),
+            GateOutput::WakeDetected => println!("(wake detected during THINKING/SPEAKING)"),
             GateOutput::None => {}
         }
     }
