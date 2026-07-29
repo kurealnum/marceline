@@ -128,6 +128,18 @@ pub struct VadConfig {
     pub min_utterance_ms: u32,
     /// Maximum utterance duration (ms).
     pub max_utterance_ms: u32,
+    /// Milliseconds of continuous VAD-confirmed speech required after a
+    /// wake-word fire during THINKING/SPEAKING before a barge-in commits
+    /// (EPIC 7.3) — absorbs a cough/spurious detection without cancelling
+    /// an in-flight turn. Defaults for configs predating this story.
+    #[serde(default = "default_barge_in_confirm_ms")]
+    pub barge_in_confirm_ms: u32,
+}
+
+/// Default for [`VadConfig::barge_in_confirm_ms`]: long enough to absorb a
+/// cough, short enough to stay within the barge-in "feel" (§2.5.1).
+fn default_barge_in_confirm_ms() -> u32 {
+    300
 }
 
 /// Memory/history store configuration (`[memory]`).
