@@ -40,6 +40,7 @@ pub use mcp::{register_mcp_tools, McpCallOutcome, McpClient, McpError, McpTool, 
 pub use orchestrator::{
     ConversationEvent, ConversationState, FailedStage, IllegalTransition, Orchestrator, Stages,
 };
+pub use soul::{Persona, SoulError, ToolDecision, ToolPolicy};
 pub use stt::{
     GrpcSttEngine, SttEngine, SttInfo, SttManager, SttWorkerPaths, SwapError, Transcript,
     TranscriptStream,
