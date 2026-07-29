@@ -44,6 +44,10 @@ pub use llm::{
     ToolCallRequest, ToolSpec, TrimPolicy, Trust, TurnBuffer,
 };
 pub use mcp::{register_mcp_tools, McpCallOutcome, McpClient, McpError, McpTool, McpToolInfo};
+pub use memory::{
+    compile_prompt_with_retrieval, ensure_current_embed_model, reembed_all, retrieve_similar,
+    store_memory, MemoryError,
+};
 pub use orchestrator::{
     ConversationEvent, ConversationState, FailedStage, IllegalTransition, Orchestrator, Stages,
 };
