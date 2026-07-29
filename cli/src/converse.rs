@@ -48,7 +48,6 @@ use marceline_core::{
     TtsEngine, VadEndpointer, VoiceId, DEFAULT_SPEECH_THRESHOLD,
 };
 use marceline_core::audio::Capture;
-use marceline_core::soul::Persona;
 use tokio::sync::{watch, RwLock};
 use tokio_util::sync::CancellationToken;
 
@@ -151,14 +150,27 @@ impl<'a> Stages for ErrorSpeaker<'a> {
 /// concrete values are a tuning knob (EPIC 8.3), not this story's job.
 const WAKE_POLL_TIMEOUT: Duration = Duration::from_millis(200);
 
+/// How often the SOUL.md hot-reload watcher checks the file's mtime
+/// (EPIC 9.2). Fast enough that a save feels live, cheap enough to poll
+/// forever in the background.
+const SOUL_WATCH_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
 /// Runs the MVP loop forever: wake, listen, transcribe, think, speak,
 /// back to idle. Returns only on an unrecoverable setup failure (a worker
 /// or device that never came up) — a mid-turn stage failure routes
 /// through the orchestrator's `ERROR` edge and the loop keeps running.
 pub async fn converse(config_path: &Path, soul_path: &Path) -> Result<(), ConverseError> {
     let config = Config::load(config_path)?;
-    let persona = Persona::load(soul_path).unwrap_or_default();
-    let system_prompt = compile_system_prompt(&persona.render(), &[]);
+
+    // Hot-reload SOUL.md in the background (EPIC 9.2): each turn below
+    // recompiles the system prompt from the watcher's latest persona, so an
+    // edit takes effect on the next turn with no restart.
+    let soul_watch_cancel = CancellationToken::new();
+    let (soul_watcher, soul_watch_handle) = marceline_core::soul_watch::watch(
+        soul_path.to_path_buf(),
+        SOUL_WATCH_POLL_INTERVAL,
+        soul_watch_cancel.clone(),
+    );
 
     let capture = Capture::start(1.5, config.audio.input_device.as_deref())?;
     let detector = EnergyWakeDetector::new(config.wake.sensitivity, 16_000, 1600);
@@ -232,13 +244,15 @@ pub async fn converse(config_path: &Path, soul_path: &Path) -> Result<(), Conver
         &config.stt.lang,
         &voice,
         &config,
-        &system_prompt,
+        &soul_watcher,
         &current_run,
     )
     .await;
 
     let _ = stt_shutdown_tx.send(true);
     let _ = tts_shutdown_tx.send(true);
+    soul_watch_cancel.cancel();
+    let _ = soul_watch_handle.await;
     result
 }
 
@@ -254,7 +268,7 @@ async fn run_loop(
     lang: &str,
     voice: &VoiceId,
     config: &Config,
-    system_prompt: &str,
+    soul_watcher: &marceline_core::soul_watch::SoulWatcher,
     current_run: &CurrentRun,
 ) -> Result<(), ConverseError> {
     let transcribe_timeout = Duration::from_millis(config.orchestrator.transcribe_timeout_ms);
@@ -408,8 +422,12 @@ async fn run_loop(
             .expect("Transcribing always accepts FinalTranscript");
 
         // THINKING: only `Final` transcripts ever reach here (§2.4.1).
+        // Recompiled from the watcher's latest persona every turn, so a
+        // SOUL.md save takes effect on the very next turn (EPIC 9.2).
+        let persona = soul_watcher.current();
+        let system_prompt = compile_system_prompt(&persona.render(), &[]);
         let messages = vec![
-            Message::new(Role::System, system_prompt),
+            Message::new(Role::System, &system_prompt),
             Message::new(Role::User, transcript),
         ];
         let events = llm

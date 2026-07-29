@@ -12,6 +12,7 @@ pub mod logging;
 pub mod mcp;
 pub mod orchestrator;
 pub mod soul;
+pub mod soul_watch;
 pub mod stt;
 pub mod supervisor;
 pub mod thinking;
