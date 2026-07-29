@@ -9,6 +9,7 @@ use std::sync::Arc;
 use marceline_core::{Device, HealthView, Supervisor, WorkerSpec};
 use tokio::sync::{watch, RwLock};
 
+mod converse;
 mod say;
 mod say_to_llm;
 mod transcribe;
@@ -40,6 +41,7 @@ fn main() -> ExitCode {
         Some("transcribe") => runtime.block_on(run_transcribe(&args)),
         Some("say") => runtime.block_on(run_say(&args)),
         Some("say-to-llm") => runtime.block_on(run_say_to_llm(&args)),
+        Some("converse") => runtime.block_on(run_converse(&args)),
         Some("config") => run_config(&args),
         Some("--help") | Some("-h") => {
             print_usage();
@@ -68,6 +70,7 @@ Usage:
   marceline transcribe <file.wav>      Transcribe a wav file and print the text
   marceline say <text>                 Speak text aloud, per [tts] config
   marceline say-to-llm <text>          Stream an LLM reply to text, per [llm] config
+  marceline converse                   Run the full wake->listen->think->speak MVP loop
   marceline config get <key>           Print a config value
   marceline config set <key> <value>   Change a config value
   marceline --version                  Print the version
@@ -183,6 +186,26 @@ async fn run_say_to_llm(args: &[String]) -> ExitCode {
         }
         Err(err) => {
             eprintln!("say-to-llm failed: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Runs `marceline converse` (EPIC 8.2, the MVP loop demo).
+///
+/// Runs forever: wake, listen, transcribe, think, speak, back to idle.
+/// Exits non-zero only on a setup failure (a device or worker that never
+/// came up) — a mid-turn stage failure is handled in-loop via the
+/// orchestrator's `ERROR` edge and does not end the process.
+async fn run_converse(args: &[String]) -> ExitCode {
+    let config_path =
+        PathBuf::from(flag_value(args, "--config").unwrap_or_else(|| DEFAULT_CONFIG.to_string()));
+    let soul_path = converse::soul_path_from_args(args);
+
+    match converse::converse(&config_path, &soul_path).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("converse failed: {err}");
             ExitCode::FAILURE
         }
     }
