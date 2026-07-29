@@ -37,6 +37,26 @@ pub enum ConversationState {
     Error,
 }
 
+/// Which stage failed or timed out (SPEC.md §2.5, EPIC 8.3).
+///
+/// Distinguished from a plain string reason because [`Stages::on_enter_error`]
+/// must special-case [`FailedStage::Tts`]: every other failure gets a
+/// spoken graceful message, but if TTS itself is what failed, no spoken
+/// message is possible, so `ERROR` logs and returns to `Idle` silently
+/// (accepted, §9.11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailedStage {
+    /// The wake/VAD gate (EPIC 2) — e.g. `no-speech` timeout in `Listening`.
+    Gate,
+    /// Speech-to-text (EPIC 3) — worker-down, timeout, or empty/failed transcript.
+    Stt,
+    /// The LLM (EPIC 4) — request error or tool timeout in `Thinking`.
+    Llm,
+    /// Text-to-speech (EPIC 5) — worker-down or timeout in `Speaking`. The
+    /// one stage whose own failure cannot be spoken.
+    Tts,
+}
+
 /// An event that drives a transition between [`ConversationState`]s.
 #[derive(Debug, Clone)]
 pub enum ConversationEvent {
@@ -54,9 +74,15 @@ pub enum ConversationEvent {
     /// (§2.5.1); cancels the in-flight stage via the run's
     /// [`CancellationToken`] and jumps back to `Listening`.
     BargeIn,
-    /// Any stage failed or timed out (EPIC 8.3). Carries a human-readable
-    /// reason for logging; the graceful spoken message itself is 8.3's job.
-    StageError(String),
+    /// A stage failed or timed out (EPIC 8.3). Carries which stage failed
+    /// (so `ERROR` knows whether a spoken message is possible) and a
+    /// human-readable reason for logging.
+    StageError {
+        /// Which stage failed or timed out.
+        stage: FailedStage,
+        /// Human-readable reason, for logging.
+        reason: String,
+    },
     /// The `ERROR` state finished handling the failure (message spoken, or
     /// logged silently if TTS itself was the failed stage, §9.11) and is
     /// ready to return to `Idle`.
@@ -88,8 +114,14 @@ impl std::error::Error for IllegalTransition {}
 /// A single `run` [`CancellationToken`] (EPIC 8.4) is threaded through
 /// every call so barge-in / cancellation has one place to fire from and
 /// every stage has one place to observe it.
-#[async_trait]
-pub trait Stages: Send + Sync {
+///
+/// `?Send`: a real implementation (EPIC 8.3) holds a reference to the
+/// audio [`Playback`][crate::audio::Playback] sink to speak `ERROR`'s
+/// graceful message, and `cpal`'s stream handle is not `Send` — the
+/// orchestrator is driven from one task, never spawned across threads, so
+/// nothing requires it.
+#[async_trait(?Send)]
+pub trait Stages {
     /// Entering `Listening`: the gate (EPIC 2) starts collecting an utterance.
     async fn on_enter_listening(&self, run: &CancellationToken);
     /// Entering `Transcribing`: hand the collected segment to STT (EPIC 3).
@@ -100,9 +132,9 @@ pub trait Stages: Send + Sync {
     /// Entering `Speaking`: streamed tokens are already sentence-chunked
     /// into TTS (EPIC 5) by the time this fires.
     async fn on_enter_speaking(&self, run: &CancellationToken);
-    /// Entering `Error`: speak a graceful message (EPIC 8.3), unless the
-    /// failed stage was TTS itself, in which case this logs only (§9.11).
-    async fn on_enter_error(&self, reason: &str);
+    /// Entering `Error`: speak a graceful message (EPIC 8.3), unless
+    /// `stage` is [`FailedStage::Tts`], in which case this logs only (§9.11).
+    async fn on_enter_error(&self, stage: FailedStage, reason: &str);
 }
 
 /// Drives one conversation loop through [`ConversationState`]s.
@@ -148,7 +180,7 @@ impl<S: Stages> Orchestrator<S> {
 
         // The ERROR edge is reachable from every state except ERROR itself
         // (a second failure while already handling one just stays put).
-        if let E::StageError(reason) = &event {
+        if let E::StageError { stage, reason } = &event {
             if self.state == St::Error {
                 return Err(IllegalTransition {
                     from: self.state,
@@ -159,7 +191,7 @@ impl<S: Stages> Orchestrator<S> {
                 t.cancel();
             }
             let next = St::Error;
-            self.stages.on_enter_error(reason).await;
+            self.stages.on_enter_error(*stage, reason).await;
             self.transition(next, "StageError");
             return Ok(next);
         }
@@ -233,7 +265,7 @@ fn event_name(event: &ConversationEvent) -> &'static str {
         ConversationEvent::FirstTtsChunk => "FirstTtsChunk",
         ConversationEvent::PlaybackDone => "PlaybackDone",
         ConversationEvent::BargeIn => "BargeIn",
-        ConversationEvent::StageError(_) => "StageError",
+        ConversationEvent::StageError { .. } => "StageError",
         ConversationEvent::ErrorHandled => "ErrorHandled",
     }
 }
@@ -252,7 +284,7 @@ mod tests {
         error: AtomicUsize,
     }
 
-    #[async_trait]
+    #[async_trait(?Send)]
     impl Stages for FakeStages {
         async fn on_enter_listening(&self, _run: &CancellationToken) {
             self.listening.fetch_add(1, Ordering::SeqCst);
@@ -266,7 +298,7 @@ mod tests {
         async fn on_enter_speaking(&self, _run: &CancellationToken) {
             self.speaking.fetch_add(1, Ordering::SeqCst);
         }
-        async fn on_enter_error(&self, _reason: &str) {
+        async fn on_enter_error(&self, _stage: FailedStage, _reason: &str) {
             self.error.fetch_add(1, Ordering::SeqCst);
         }
     }
@@ -348,9 +380,12 @@ mod tests {
         let run = orch.run_token().unwrap().clone();
 
         assert_eq!(
-            orch.apply(ConversationEvent::StageError("stt worker down".into()))
-                .await
-                .unwrap(),
+            orch.apply(ConversationEvent::StageError {
+                stage: FailedStage::Stt,
+                reason: "stt worker down".into(),
+            })
+            .await
+            .unwrap(),
             ConversationState::Error
         );
         assert!(run.is_cancelled());
@@ -366,12 +401,18 @@ mod tests {
     async fn error_while_already_in_error_is_illegal() {
         let mut orch = Orchestrator::new(FakeStages::default());
         orch.apply(ConversationEvent::WakeWord).await.unwrap();
-        orch.apply(ConversationEvent::StageError("boom".into()))
-            .await
-            .unwrap();
+        orch.apply(ConversationEvent::StageError {
+            stage: FailedStage::Llm,
+            reason: "boom".into(),
+        })
+        .await
+        .unwrap();
 
         let err = orch
-            .apply(ConversationEvent::StageError("boom again".into()))
+            .apply(ConversationEvent::StageError {
+                stage: FailedStage::Llm,
+                reason: "boom again".into(),
+            })
             .await
             .unwrap_err();
         assert_eq!(err.from, ConversationState::Error);

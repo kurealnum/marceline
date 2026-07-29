@@ -33,6 +33,12 @@ sensitivity = 0.6
 silence_ms = 700
 min_utterance_ms = 300
 max_utterance_ms = 15000
+no_speech_timeout_ms = 3000
+
+[orchestrator]
+transcribe_timeout_ms = 30000
+think_timeout_ms = 30000
+speak_timeout_ms = 10000
 
 [memory]
 db_path = "~/.marceline/history.db"

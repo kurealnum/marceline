@@ -213,6 +213,7 @@ mod tests {
             min_utterance_ms: 300,
             max_utterance_ms: 15_000,
             barge_in_confirm_ms: 300,
+        no_speech_timeout_ms: 3_000,
         };
         Gate::new(wake, endpointer, &vad_config)
     }
