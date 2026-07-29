@@ -178,6 +178,14 @@ impl Persona {
         ToolPolicy::parse(self.tools_policy.as_deref().unwrap_or(""))
     }
 
+    /// Parses this persona's Voice section into a [`VoicePreference`]
+    /// (§3.2, EPIC 9.4). An absent section, or one with no `voice:` line,
+    /// yields a preference of `None`, telling the caller to keep the
+    /// `config.toml` default.
+    pub fn voice_preference(&self) -> VoicePreference {
+        VoicePreference::parse(self.voice.as_deref().unwrap_or(""))
+    }
+
     /// Renders this persona back to canonical markdown, in the fixed order
     /// §3.2 suggests, for the system-prompt compiler to consume in place of
     /// `SOUL.md`'s raw text.
@@ -280,6 +288,39 @@ impl ToolPolicy {
             SafetyClass::ReadOnly => ToolDecision::Auto,
             SafetyClass::SideEffecting | SafetyClass::Dangerous => ToolDecision::Confirm,
         }
+    }
+}
+
+/// Voice preference parsed from SOUL.md's `# Voice` section (§3.2,
+/// EPIC 9.4): which TTS voice id the user asked for, if any.
+///
+/// The Voice section is prose ("Fast pacing, prefer af_bella"), not a
+/// strict format; only an explicit `voice: <id>` line is recognized as a
+/// concrete preference. Everything else in the section (pacing,
+/// terse-vs-expansive) is intent for the compiled prompt, not a value this
+/// type extracts — it has nowhere structured to go yet.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VoicePreference {
+    /// The requested TTS voice id, if the Voice section named one.
+    pub voice_id: Option<String>,
+}
+
+impl VoicePreference {
+    /// Parses `text` for a `voice: <id>` line (an optional leading
+    /// `-`/`*` list marker is stripped first, matching [`ToolPolicy`]'s
+    /// tolerance for a user writing it as a bullet). The first match wins;
+    /// no match yields `voice_id: None`.
+    pub fn parse(text: &str) -> VoicePreference {
+        let voice_id = text.lines().find_map(|line| {
+            let line = line.trim().trim_start_matches(['-', '*']).trim();
+            let (key, value) = line.split_once(':')?;
+            if !key.trim().eq_ignore_ascii_case("voice") {
+                return None;
+            }
+            let value = value.trim();
+            (!value.is_empty()).then(|| value.to_string())
+        });
+        VoicePreference { voice_id }
     }
 }
 
@@ -459,5 +500,23 @@ Marceline.
             policy.decision("shell.run", SafetyClass::ReadOnly),
             ToolDecision::Confirm
         );
+    }
+
+    #[test]
+    fn voice_preference_parses_an_explicit_voice_line() {
+        let pref = VoicePreference::parse("Fast pacing, terse.\n- voice: af_bella\n");
+        assert_eq!(pref.voice_id.as_deref(), Some("af_bella"));
+    }
+
+    #[test]
+    fn voice_preference_is_none_without_a_voice_line() {
+        let pref = VoicePreference::parse("Fast pacing, terse.\n");
+        assert_eq!(pref.voice_id, None);
+    }
+
+    #[test]
+    fn persona_voice_preference_reads_the_voice_section() {
+        let persona = Persona::parse("# Voice\n\nvoice: af_sky\n");
+        assert_eq!(persona.voice_preference().voice_id.as_deref(), Some("af_sky"));
     }
 }

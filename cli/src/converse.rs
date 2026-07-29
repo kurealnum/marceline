@@ -482,7 +482,17 @@ async fn run_loop(
             futures::stream::once(async move { Ok(first_sentence) }).chain(rest),
         );
 
-        let mut audio = tts.synthesize(text_stream, voice.clone()).await;
+        // Resolved fresh every turn from the watcher's latest persona
+        // (EPIC 9.4): a SOUL.md voice change takes effect on the next
+        // reply, same as a persona/tool-policy edit (EPIC 9.2/9.3), and an
+        // unavailable request falls back to the config default rather
+        // than failing the turn.
+        let resolved_voice = marceline_core::resolve_voice(
+            persona.voice_preference().voice_id.as_deref(),
+            &tts.info(),
+            voice,
+        );
+        let mut audio = tts.synthesize(text_stream, resolved_voice).await;
         let first_chunk = match tokio::time::timeout(speak_timeout, audio.next()).await {
             Ok(Some(Ok(chunk))) => chunk,
             Ok(Some(Err(err))) => {
