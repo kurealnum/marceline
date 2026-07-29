@@ -12,8 +12,9 @@
 //! reached midway through the LLM+TTS pipeline, not at the moment
 //! `THINKING` is entered — the orchestrator's `apply` needs `&mut self`,
 //! so the party best placed to call it the instant that chunk arrives is
-//! this loop, not a `&self` hook. [`NoopStages`] fulfills the trait so the
-//! orchestrator still has somewhere to log from.
+//! this loop, not a `&self` hook. [`ErrorSpeaker`]'s happy-path hooks are
+//! no-ops for the same reason; only its `on_enter_error` does real work
+//! (EPIC 8.3's graceful spoken failure message).
 //!
 //! No tools, no memory, no barge-in yet (out of scope per the issue) — one
 //! provider per stage, exactly the MVP bar.
@@ -30,9 +31,9 @@ use marceline_core::transcribe::{TranscribeOutcome, DEFAULT_TIMEOUT};
 use marceline_core::tts::TtsWorkerPaths;
 use marceline_core::{
     compile_system_prompt, sentence_chunk, ChatRequest, Config, ConversationEvent,
-    EnergyWakeDetector, Gate, GateOutput, HealthView, LlmEngine, Message, OpenAiCompatibleEngine,
-    Orchestrator, Playback, Role, SileroVad, SttManager, Stages, TtsEngine, VadEndpointer,
-    VoiceId, DEFAULT_SPEECH_THRESHOLD,
+    EnergyWakeDetector, FailedStage, Gate, GateOutput, HealthView, LlmEngine, Message,
+    OpenAiCompatibleEngine, Orchestrator, Playback, Role, SileroVad, SttManager, Stages, TtsEngine,
+    VadEndpointer, VoiceId, DEFAULT_SPEECH_THRESHOLD,
 };
 use marceline_core::audio::Capture;
 use tokio::sync::{watch, RwLock};
@@ -58,19 +59,59 @@ pub enum ConverseError {
     Vad(#[from] marceline_core::VadError),
 }
 
-/// A [`Stages`] impl that does nothing: this story's real stage work runs
-/// in [`converse`]'s driving loop instead (see module docs for why), but
-/// the orchestrator still needs a `Stages` to log transitions from.
-struct NoopStages;
+/// A short, fixed message spoken on any non-TTS stage failure (SPEC.md
+/// §9.11, EPIC 8.3). v1 does not attempt to tailor this per failure —
+/// just make sure the user hears *something* rather than silence.
+const GRACEFUL_ERROR_MESSAGE: &str = "Sorry, I ran into a problem with that. Please try again.";
 
-#[async_trait]
-impl Stages for NoopStages {
+/// A [`Stages`] impl whose only real work is the `ERROR` edge (SPEC.md
+/// §2.5, EPIC 8.3): every other hook is a no-op because the happy-path
+/// stage work runs in [`converse`]'s driving loop instead (see module
+/// docs for why — `THINKING -> SPEAKING` fires mid-stage, not at entry).
+///
+/// On error, speaks [`GRACEFUL_ERROR_MESSAGE`] through the same TTS
+/// engine/playback the happy path uses — unless the failed stage *is*
+/// TTS, in which case no spoken message is possible and this only logs
+/// (§9.11's accepted exception).
+struct ErrorSpeaker<'a> {
+    tts: &'a dyn TtsEngine,
+    playback: &'a Playback,
+    voice: &'a VoiceId,
+}
+
+#[async_trait(?Send)]
+impl<'a> Stages for ErrorSpeaker<'a> {
     async fn on_enter_listening(&self, _run: &CancellationToken) {}
     async fn on_enter_transcribing(&self, _run: &CancellationToken) {}
     async fn on_enter_thinking(&self, _run: &CancellationToken) {}
     async fn on_enter_speaking(&self, _run: &CancellationToken) {}
-    async fn on_enter_error(&self, reason: &str) {
-        tracing::error!(reason, "conversation turn failed");
+
+    async fn on_enter_error(&self, stage: FailedStage, reason: &str) {
+        tracing::error!(?stage, reason, "conversation turn failed");
+        if stage == FailedStage::Tts {
+            // Can't speak a TTS failure through the TTS that just failed
+            // — log only and return to IDLE silently (§9.11).
+            return;
+        }
+
+        let text_stream: marceline_core::TextStream = Box::pin(futures::stream::once(async {
+            Ok(GRACEFUL_ERROR_MESSAGE.to_string())
+        }));
+        let mut audio = self.tts.synthesize(text_stream, self.voice.clone()).await;
+        while let Some(chunk) = audio.next().await {
+            match chunk {
+                Ok(chunk) => self.playback.push(&chunk),
+                Err(err) => {
+                    // The graceful message itself failed to speak; nothing
+                    // more we can do here without recursing into ERROR.
+                    tracing::error!(%err, "failed to speak graceful error message");
+                    break;
+                }
+            }
+        }
+        while self.playback.buffered_samples() > 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }
 
@@ -154,7 +195,14 @@ async fn run_loop(
     system_prompt: &str,
 ) -> Result<(), ConverseError> {
     let llm = OpenAiCompatibleEngine::new(&config.llm, CancellationToken::new())?;
-    let mut orchestrator = Orchestrator::new(NoopStages);
+    let transcribe_timeout = Duration::from_millis(config.orchestrator.transcribe_timeout_ms);
+    let think_timeout = Duration::from_millis(config.orchestrator.think_timeout_ms);
+    let speak_timeout = Duration::from_millis(config.orchestrator.speak_timeout_ms);
+    let mut orchestrator = Orchestrator::new(ErrorSpeaker {
+        tts,
+        playback,
+        voice,
+    });
 
     'turn: loop {
         // IDLE: poll the mic for the wake word.
@@ -172,7 +220,9 @@ async fn run_loop(
             }
         }
 
-        // LISTENING: collect the utterance.
+        // LISTENING: collect the utterance. The gate's own no-speech
+        // timeout (`[vad].no_speech_timeout_ms`, EPIC 8.3) covers the
+        // "nobody spoke after the wake word" edge internally.
         let segment = loop {
             let Ok(chunk) = capture.chunks().recv_timeout(WAKE_POLL_TIMEOUT) else {
                 continue;
@@ -186,7 +236,10 @@ async fn run_loop(
                     // (no ERROR — this is a normal empty-turn, not a fault)
                     // and start the next turn over from IDLE.
                     let _ = orchestrator
-                        .apply(ConversationEvent::StageError("no speech captured".into()))
+                        .apply(ConversationEvent::StageError {
+                            stage: FailedStage::Gate,
+                            reason: "no speech captured".into(),
+                        })
                         .await;
                     let _ = orchestrator.apply(ConversationEvent::ErrorHandled).await;
                     continue 'turn;
@@ -200,19 +253,42 @@ async fn run_loop(
             .await
             .expect("Listening always accepts VadEnd");
 
-        // TRANSCRIBING.
-        let transcript = match stt.transcribe(segment, DEFAULT_TIMEOUT).await {
-            Ok(TranscribeOutcome::Committed(t)) => t.text,
-            Ok(TranscribeOutcome::Rejected(rejection)) => {
+        // TRANSCRIBING: worker-down surfaces as either a timeout here or
+        // an `EngineError` from `transcribe` itself; both route through
+        // the same `StageError`.
+        let transcript = match tokio::time::timeout(
+            transcribe_timeout,
+            stt.transcribe(segment, DEFAULT_TIMEOUT),
+        )
+        .await
+        {
+            Ok(Ok(TranscribeOutcome::Committed(t))) => t.text,
+            Ok(Ok(TranscribeOutcome::Rejected(rejection))) => {
                 let _ = orchestrator
-                    .apply(ConversationEvent::StageError(rejection.reason()))
+                    .apply(ConversationEvent::StageError {
+                        stage: FailedStage::Stt,
+                        reason: rejection.reason(),
+                    })
                     .await;
                 let _ = orchestrator.apply(ConversationEvent::ErrorHandled).await;
                 continue;
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 let _ = orchestrator
-                    .apply(ConversationEvent::StageError(err.to_string()))
+                    .apply(ConversationEvent::StageError {
+                        stage: FailedStage::Stt,
+                        reason: err.to_string(),
+                    })
+                    .await;
+                let _ = orchestrator.apply(ConversationEvent::ErrorHandled).await;
+                continue;
+            }
+            Err(_elapsed) => {
+                let _ = orchestrator
+                    .apply(ConversationEvent::StageError {
+                        stage: FailedStage::Stt,
+                        reason: "stt timed out".into(),
+                    })
                     .await;
                 let _ = orchestrator.apply(ConversationEvent::ErrorHandled).await;
                 continue;
@@ -238,22 +314,39 @@ async fn run_loop(
             .await;
         let mut sentences = sentence_chunk(events);
 
-        // First sentence pulled eagerly: this is the "first TTS chunk"
-        // trigger, so the transition into Speaking is driven by actually
-        // having something to say, not by entering Thinking.
-        let first_sentence = match sentences.next().await {
-            Some(Ok(text)) => text,
-            Some(Err(err)) => {
+        // First sentence pulled eagerly, under `think_timeout`: this is
+        // the "first TTS chunk" trigger, so the transition into Speaking
+        // is driven by actually having something to say, not by entering
+        // Thinking. A stuck/dead LLM shows up here as a timeout.
+        let first_sentence = match tokio::time::timeout(think_timeout, sentences.next()).await {
+            Ok(Some(Ok(text))) => text,
+            Ok(Some(Err(err))) => {
                 let _ = orchestrator
-                    .apply(ConversationEvent::StageError(err.to_string()))
+                    .apply(ConversationEvent::StageError {
+                        stage: FailedStage::Llm,
+                        reason: err.to_string(),
+                    })
                     .await;
                 let _ = orchestrator.apply(ConversationEvent::ErrorHandled).await;
                 continue;
             }
-            None => {
+            Ok(None) => {
                 // The model returned no text at all; nothing to speak.
                 let _ = orchestrator
-                    .apply(ConversationEvent::StageError("empty llm response".into()))
+                    .apply(ConversationEvent::StageError {
+                        stage: FailedStage::Llm,
+                        reason: "empty llm response".into(),
+                    })
+                    .await;
+                let _ = orchestrator.apply(ConversationEvent::ErrorHandled).await;
+                continue;
+            }
+            Err(_elapsed) => {
+                let _ = orchestrator
+                    .apply(ConversationEvent::StageError {
+                        stage: FailedStage::Llm,
+                        reason: "llm timed out".into(),
+                    })
                     .await;
                 let _ = orchestrator.apply(ConversationEvent::ErrorHandled).await;
                 continue;
@@ -265,18 +358,34 @@ async fn run_loop(
         );
 
         let mut audio = tts.synthesize(text_stream, voice.clone()).await;
-        let first_chunk = match audio.next().await {
-            Some(Ok(chunk)) => chunk,
-            Some(Err(err)) => {
+        let first_chunk = match tokio::time::timeout(speak_timeout, audio.next()).await {
+            Ok(Some(Ok(chunk))) => chunk,
+            Ok(Some(Err(err))) => {
                 let _ = orchestrator
-                    .apply(ConversationEvent::StageError(err.to_string()))
+                    .apply(ConversationEvent::StageError {
+                        stage: FailedStage::Tts,
+                        reason: err.to_string(),
+                    })
                     .await;
                 let _ = orchestrator.apply(ConversationEvent::ErrorHandled).await;
                 continue;
             }
-            None => {
+            Ok(None) => {
                 let _ = orchestrator
-                    .apply(ConversationEvent::StageError("tts produced no audio".into()))
+                    .apply(ConversationEvent::StageError {
+                        stage: FailedStage::Tts,
+                        reason: "tts produced no audio".into(),
+                    })
+                    .await;
+                let _ = orchestrator.apply(ConversationEvent::ErrorHandled).await;
+                continue;
+            }
+            Err(_elapsed) => {
+                let _ = orchestrator
+                    .apply(ConversationEvent::StageError {
+                        stage: FailedStage::Tts,
+                        reason: "tts timed out".into(),
+                    })
                     .await;
                 let _ = orchestrator.apply(ConversationEvent::ErrorHandled).await;
                 continue;
@@ -294,7 +403,10 @@ async fn run_loop(
                 Ok(chunk) => playback.push(&chunk),
                 Err(err) => {
                     let _ = orchestrator
-                        .apply(ConversationEvent::StageError(err.to_string()))
+                        .apply(ConversationEvent::StageError {
+                            stage: FailedStage::Tts,
+                            reason: err.to_string(),
+                        })
                         .await;
                     let _ = orchestrator.apply(ConversationEvent::ErrorHandled).await;
                     break;

@@ -30,12 +30,6 @@ use crate::vad::FRAME_SAMPLES;
 use crate::wake::WakeEngine;
 use crate::{AudioChunk, VadEndpointer};
 
-/// How long LISTENING waits for speech to begin (after wake fires) before
-/// giving up and returning to IDLE. Not one of the three `[vad]` knobs
-/// this story wires; concrete timeout values are a tuning knob (SPEC.md
-/// EPIC 8.3) and this is a reasonable placeholder.
-const NO_SPEECH_TIMEOUT_MS: u64 = 3_000;
-
 /// Which state the gate is in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateState {
@@ -87,6 +81,10 @@ pub struct Gate {
     silence_end_ms: u64,
     min_utterance_ms: u64,
     max_utterance_ms: u64,
+    /// How long LISTENING waits for speech to begin (after wake fires)
+    /// before giving up and returning to IDLE (`[vad].no_speech_timeout_ms`,
+    /// EPIC 8.3's "no-speech" edge — a tuning knob, not hardcoded).
+    no_speech_timeout_ms: u64,
     /// Chunks collected for the utterance in progress, at capture's
     /// native sample_rate/channels (not resampled) so the emitted segment
     /// is full quality for STT.
@@ -120,6 +118,7 @@ impl Gate {
             silence_end_ms: vad_config.silence_ms as u64,
             min_utterance_ms: vad_config.min_utterance_ms as u64,
             max_utterance_ms: vad_config.max_utterance_ms as u64,
+            no_speech_timeout_ms: vad_config.no_speech_timeout_ms,
             utterance: Vec::new(),
             vad_pending: Vec::new(),
             speech_seen: false,
@@ -255,7 +254,7 @@ impl Gate {
 
         if !self.speech_seen {
             self.no_speech_elapsed_ms += chunk_ms;
-            if self.no_speech_elapsed_ms >= NO_SPEECH_TIMEOUT_MS {
+            if self.no_speech_elapsed_ms >= self.no_speech_timeout_ms {
                 self.state = GateState::Idle;
                 self.utterance.clear();
                 return GateOutput::NoSpeechTimeout;

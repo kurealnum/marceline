@@ -134,12 +134,23 @@ pub struct VadConfig {
     /// an in-flight turn. Defaults for configs predating this story.
     #[serde(default = "default_barge_in_confirm_ms")]
     pub barge_in_confirm_ms: u32,
+    /// How long `LISTENING` waits for speech to begin after a wake word
+    /// fires before giving up and returning to `IDLE` (SPEC.md §2.5, EPIC
+    /// 8.3's "no-speech" edge). Defaults for configs predating this story.
+    #[serde(default = "default_no_speech_timeout_ms")]
+    pub no_speech_timeout_ms: u64,
 }
 
 /// Default for [`VadConfig::barge_in_confirm_ms`]: long enough to absorb a
 /// cough, short enough to stay within the barge-in "feel" (§2.5.1).
 fn default_barge_in_confirm_ms() -> u32 {
     300
+}
+
+/// Default for [`VadConfig::no_speech_timeout_ms`]: the gate's original
+/// hardcoded placeholder (EPIC 2.3), now a tunable knob (EPIC 8.3).
+fn default_no_speech_timeout_ms() -> u64 {
+    3_000
 }
 
 /// Memory/history store configuration (`[memory]`).
@@ -229,6 +240,59 @@ pub struct AudioConfig {
     pub output_device: Option<String>,
 }
 
+/// Per-stage timeouts for the orchestrator's `ERROR` edges (`[orchestrator]`,
+/// SPEC.md §2.5, EPIC 8.3).
+///
+/// Absent from older config files entirely (the whole section defaults via
+/// `#[serde(default)]` on [`Config::orchestrator`]); concrete values are a
+/// tuning knob, not something this story needs to get exactly right.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OrchestratorConfig {
+    /// How long `TRANSCRIBING` waits for STT before treating it as a
+    /// worker-down/stuck failure.
+    #[serde(default = "default_transcribe_timeout_ms")]
+    pub transcribe_timeout_ms: u64,
+    /// How long `THINKING` waits for the LLM's first sentence-chunked
+    /// segment before treating it as an LLM error/timeout.
+    #[serde(default = "default_think_timeout_ms")]
+    pub think_timeout_ms: u64,
+    /// How long `THINKING` waits for TTS to produce its first audio chunk
+    /// (the trigger for `THINKING -> SPEAKING`) before treating it as a
+    /// TTS worker-down/timeout failure.
+    #[serde(default = "default_speak_timeout_ms")]
+    pub speak_timeout_ms: u64,
+}
+
+impl Default for OrchestratorConfig {
+    fn default() -> Self {
+        Self {
+            transcribe_timeout_ms: default_transcribe_timeout_ms(),
+            think_timeout_ms: default_think_timeout_ms(),
+            speak_timeout_ms: default_speak_timeout_ms(),
+        }
+    }
+}
+
+/// Default for [`OrchestratorConfig::transcribe_timeout_ms`]: matches the
+/// pre-existing `transcribe::DEFAULT_TIMEOUT` this knob replaces.
+fn default_transcribe_timeout_ms() -> u64 {
+    30_000
+}
+
+/// Default for [`OrchestratorConfig::think_timeout_ms`]: generous enough
+/// for a cold local model's first token, short enough that a truly wedged
+/// backend does not hang the conversation indefinitely.
+fn default_think_timeout_ms() -> u64 {
+    30_000
+}
+
+/// Default for [`OrchestratorConfig::speak_timeout_ms`]: TTS's first chunk
+/// should be fast (§9.2's ≤1.5s wake→first-audio budget); this is a ceiling
+/// for a stuck worker, not the expected latency.
+fn default_speak_timeout_ms() -> u64 {
+    10_000
+}
+
 /// Top-level, versioned machine/runtime configuration (`config.toml`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -257,6 +321,11 @@ pub struct Config {
     /// only.
     #[serde(default)]
     pub mcp: Vec<McpServerConfig>,
+    /// Orchestrator per-stage error/timeout knobs (EPIC 8.3). Defaults when
+    /// the whole `[orchestrator]` section is absent, so older config files
+    /// keep loading.
+    #[serde(default)]
+    pub orchestrator: OrchestratorConfig,
 }
 
 impl Config {

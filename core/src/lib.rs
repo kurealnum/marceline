@@ -36,7 +36,7 @@ pub use llm::{
 };
 pub use mcp::{register_mcp_tools, McpCallOutcome, McpClient, McpError, McpTool, McpToolInfo};
 pub use orchestrator::{
-    ConversationEvent, ConversationState, IllegalTransition, Orchestrator, Stages,
+    ConversationEvent, ConversationState, FailedStage, IllegalTransition, Orchestrator, Stages,
 };
 pub use stt::{
     GrpcSttEngine, SttEngine, SttInfo, SttManager, SttWorkerPaths, SwapError, Transcript,
