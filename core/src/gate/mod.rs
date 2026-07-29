@@ -22,6 +22,8 @@
 //! `max_utterance_ms` force-emits a stuck/over-long segment rather than
 //! collecting forever.
 
+pub mod barge_in;
+
 use crate::audio::resample;
 use crate::config::VadConfig;
 use crate::vad::FRAME_SAMPLES;
@@ -183,6 +185,16 @@ impl Gate {
             return GateOutput::None;
         }
 
+        self.seed_utterance(chunk, preroll);
+        GateOutput::Wake
+    }
+
+    /// Resets utterance-collection state and transitions straight to
+    /// LISTENING, seeding the utterance from `preroll` (§2.6) then
+    /// `chunk` — shared by a fresh IDLE wake (`process_idle`) and a
+    /// barge-in commit (`begin_listening`, EPIC 7.2), which skip IDLE
+    /// because the wake word already fired.
+    fn seed_utterance(&mut self, chunk: &AudioChunk, preroll: &AudioChunk) {
         self.vad.reset();
         self.vad_pending.clear();
         self.speech_seen = false;
@@ -195,7 +207,14 @@ impl Gate {
         }
         self.utterance.push(chunk.clone());
         self.state = GateState::Listening;
-        GateOutput::Wake
+    }
+
+    /// Commits a barge-in (EPIC 7.2): called once the caller has
+    /// confirmed `GateOutput::WakeDetected` fired while THINKING/SPEAKING.
+    /// Seeds the follow-up utterance from `chunk`/`preroll` exactly as a
+    /// fresh IDLE wake would, and transitions straight to LISTENING.
+    pub fn begin_listening(&mut self, chunk: &AudioChunk, preroll: &AudioChunk) {
+        self.seed_utterance(chunk, preroll);
     }
 
     fn process_listening(&mut self, chunk: &AudioChunk) -> GateOutput {
