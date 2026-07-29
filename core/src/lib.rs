@@ -6,6 +6,7 @@ pub mod config_edit;
 pub mod device;
 pub mod engine;
 pub mod gate;
+pub mod history;
 pub mod ipc;
 pub mod llm;
 pub mod logging;
@@ -31,6 +32,7 @@ pub use config_edit::ConfigEditError;
 pub use device::Device;
 pub use engine::{AudioStream, EngineError};
 pub use gate::{Gate, GateOutput, GateState};
+pub use history::{HistoryError, HistoryStore, NewTurn, TurnRecord};
 pub use llm::{
     compile_system_prompt, ChatEvent, ChatEventStream, ChatRequest, DropOldestTurn, FinishReason,
     LlmEngine, LlmInfo, MemoryEntry, Message, OpenAiCompatibleEngine, Role, SessionGuard,
