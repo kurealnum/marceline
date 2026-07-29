@@ -278,6 +278,7 @@ dependencies = [
 name = "cli"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "core",
  "futures",
  "thiserror 1.0.69",
