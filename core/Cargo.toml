@@ -34,6 +34,8 @@ ort = { version = "2.0.0-rc.12", features = ["download-binaries"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 serde_json = "1"
 bytes = "1"
+# Bundled so the daemon doesn't depend on a system libsqlite3 install.
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 [dev-dependencies]
 # The STT client tests run a fake `Stt` server over a real unix socket,
