@@ -18,6 +18,7 @@ pub mod orchestrator;
 pub mod soul;
 pub mod soul_watch;
 pub mod stt;
+pub mod summarizer;
 pub mod supervisor;
 pub mod thinking;
 pub mod tools;
@@ -50,6 +51,10 @@ pub use soul::{Persona, SoulError, ToolDecision, ToolPolicy, VoicePreference};
 pub use stt::{
     GrpcSttEngine, SttEngine, SttInfo, SttManager, SttWorkerPaths, SwapError, Transcript,
     TranscriptStream,
+};
+pub use summarizer::{
+    derive_provenance, summarize_session, LlmSummarizer, SummarizeError, Summarizer,
+    SummarizerError,
 };
 pub use supervisor::{HealthView, Supervisor, WorkerSpec, WorkerState};
 pub use thinking::{
