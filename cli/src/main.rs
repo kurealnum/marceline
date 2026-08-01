@@ -11,6 +11,7 @@ use tokio::sync::{watch, RwLock};
 
 mod converse;
 mod lifecycle;
+mod logs;
 mod memory;
 mod say;
 mod say_to_llm;
@@ -54,6 +55,7 @@ fn main() -> ExitCode {
         Some(cmd @ ("start" | "stop" | "status")) => {
             runtime.block_on(lifecycle::run_lifecycle(cmd, &args))
         }
+        Some("logs") => runtime.block_on(logs::run_logs(&args)),
         // Hidden: the actual daemon body `start` spawns detached via
         // `setsid`. Not part of the documented command surface — an
         // operator drives the daemon through `start`/`stop`/`status`.
@@ -95,6 +97,7 @@ Usage:
   marceline memory search <query>      Find memories similar to a query
   marceline memory edit <id> <text>    Replace a memory's text and re-embed it
   marceline memory forget <id>         Delete a memory by row id
+  marceline logs [--follow]            Print (or stream) the daemon's log file
   marceline --version                  Print the version
 
 Settable keys: {keys}
