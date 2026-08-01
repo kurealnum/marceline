@@ -43,9 +43,9 @@ use marceline_core::transcribe::{TranscribeOutcome, DEFAULT_TIMEOUT};
 use marceline_core::tts::TtsWorkerPaths;
 use marceline_core::{
     compile_system_prompt, sentence_chunk, ChatRequest, Config, ConversationEvent,
-    EnergyWakeDetector, FailedStage, Gate, GateOutput, GrpcTtsEngine, HealthView, LlmEngine,
-    Message, OpenAiCompatibleEngine, Orchestrator, Playback, Role, SileroVad, SttManager, Stages,
-    TtsEngine, VadEndpointer, VoiceId, DEFAULT_SPEECH_THRESHOLD,
+    ConversationState, EnergyWakeDetector, FailedStage, Gate, GateOutput, GrpcTtsEngine,
+    HealthView, LlmEngine, Message, OpenAiCompatibleEngine, Orchestrator, Playback, Role,
+    SileroVad, SttManager, Stages, TtsEngine, VadEndpointer, VoiceId, DEFAULT_SPEECH_THRESHOLD,
 };
 use marceline_core::audio::Capture;
 use tokio::sync::{watch, RwLock};
@@ -159,7 +159,45 @@ const SOUL_WATCH_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// back to idle. Returns only on an unrecoverable setup failure (a worker
 /// or device that never came up) — a mid-turn stage failure routes
 /// through the orchestrator's `ERROR` edge and the loop keeps running.
+///
+/// Equivalent to `converse_ex(config_path, soul_path, None)` — the plain
+/// interactive path with no control socket and no daemon-style SIGTERM
+/// ordering (`ctrl-c` alone drives shutdown, as before).
 pub async fn converse(config_path: &Path, soul_path: &Path) -> Result<(), ConverseError> {
+    converse_ex(config_path, soul_path, None).await
+}
+
+/// How long a daemon-mode shutdown waits for playback to drain and workers
+/// to exit before giving up and returning anyway (SPEC.md §2.5.1 step 6).
+/// The supervisor's own `kill()` (EPIC 0.6) is what actually reclaims a
+/// straggling worker process; this just bounds how long this function
+/// waits to observe that happening before it returns.
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// [`converse`], with an optional `control_socket` (EPIC 11.1's daemon
+/// mode, driven by `marceline start`/`stop`/`status`).
+///
+/// When `control_socket` is `Some`, this additionally:
+/// - serves `marceline status` queries over that socket
+///   ([`marceline_core::daemon::serve_status`]) for the process's lifetime;
+/// - on SIGTERM (`marceline stop`, SPEC.md §11.1), runs the graceful
+///   shutdown ordering in the exact sequence the story specifies: (1) fire
+///   the run cancel token; (2) each side-effecting tool's own kill logic
+///   already rides that same cancellation (EPIC 6's tool broker propagates
+///   it, nothing further to do here); (3) flush + stop audio out; (4)
+///   checkpoint memory/history — a no-op today, since this MVP loop does
+///   not yet wire history/memory in (EPIC 10's daemon-startup wiring is
+///   still an open follow-up) and every write that *does* happen elsewhere
+///   already commits synchronously through `HistoryStore`'s write actor;
+///   (5) signal the STT/TTS workers to exit; (6) wait (bounded by
+///   [`SHUTDOWN_DRAIN_TIMEOUT`]) for that to land, then return so the
+///   process can exit — a still-running child is hard-killed by the
+///   supervisor's own shutdown path (EPIC 0.6), not by this function.
+pub async fn converse_ex(
+    config_path: &Path,
+    soul_path: &Path,
+    control_socket: Option<&Path>,
+) -> Result<(), ConverseError> {
     let config = Config::load(config_path)?;
 
     // Hot-reload SOUL.md in the background (EPIC 9.2): each turn below
@@ -192,6 +230,7 @@ pub async fn converse(config_path: &Path, soul_path: &Path) -> Result<(), Conver
     let stt_socket = stt_paths.socket_path.clone();
     let (stt_shutdown_tx, stt_shutdown_rx) = watch::channel(false);
     let stt_health: HealthView = Arc::new(RwLock::new(HashMap::new()));
+    let stt_health_for_status = Arc::clone(&stt_health);
     let _stt_launch = SttManager::start(
         &config.stt,
         stt_paths,
@@ -205,6 +244,7 @@ pub async fn converse(config_path: &Path, soul_path: &Path) -> Result<(), Conver
     let tts_socket = tts_paths.socket_path.clone();
     let (tts_shutdown_tx, tts_shutdown_rx) = watch::channel(false);
     let tts_health: HealthView = Arc::new(RwLock::new(HashMap::new()));
+    let tts_health_for_status = Arc::clone(&tts_health);
     let _tts_launch = marceline_core::launch_tts_worker(
         &config.tts,
         tts_paths,
@@ -214,6 +254,23 @@ pub async fn converse(config_path: &Path, soul_path: &Path) -> Result<(), Conver
     )
     .await?;
     let voice = VoiceId::from(config.tts.voice.as_str());
+
+    // Reported by `run_loop` on every state transition; `marceline status`
+    // (over `control_socket`, when daemon mode is on) reads the receiver
+    // side. Starts at `Idle` — `run_loop`'s first iteration republishes it
+    // immediately anyway.
+    let (state_tx, state_rx) = watch::channel(ConversationState::Idle);
+    let control_task = control_socket.map(|socket_path| {
+        let socket_path = socket_path.to_path_buf();
+        tokio::spawn(async move {
+            if let Err(err) =
+                marceline_core::daemon::serve_status(&socket_path, stt_health_for_status, tts_health_for_status, state_rx)
+                    .await
+            {
+                tracing::error!(%err, "control socket stopped serving");
+            }
+        })
+    });
 
     // Fired by the `ctrl-c` watcher below and set/cleared by the loop as
     // turns start and finish — the one shared handle onto "the run
@@ -235,24 +292,60 @@ pub async fn converse(config_path: &Path, soul_path: &Path) -> Result<(), Conver
         }
     });
 
-    let result = run_loop(
-        &mut gate,
-        &capture,
-        &playback,
-        &stt_socket,
-        &tts_socket,
-        &config.stt.lang,
-        &voice,
-        &config,
-        &soul_watcher,
-        &current_run,
-    )
-    .await;
+    // SIGTERM drives the graceful ordering below (SPEC.md §2.5.1, EPIC
+    // 11.1's `marceline stop`); ctrl-c above stays the interactive
+    // "cancel this turn, or exit if idle" shortcut it always was.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("failed to install SIGTERM handler");
 
+    let result = tokio::select! {
+        res = run_loop(
+            &mut gate,
+            &capture,
+            &playback,
+            &stt_socket,
+            &tts_socket,
+            &config.stt.lang,
+            &voice,
+            &config,
+            &soul_watcher,
+            &current_run,
+            &state_tx,
+        ) => res,
+        _ = sigterm.recv() => {
+            tracing::info!("SIGTERM received; running graceful shutdown ordering (SPEC.md §2.5.1)");
+            // (1) fire the run cancel token for whatever turn is in flight
+            // — idle means there is nothing to cancel.
+            if let Some(token) = current_run.lock().expect("current_run lock poisoned").clone() {
+                token.cancel();
+            }
+            // (2) each side-effecting tool's own kill logic rides that
+            // same cancellation (EPIC 6's tool broker), so there is
+            // nothing further to do here.
+            // (3) flush + stop audio out.
+            while playback.buffered_samples() > 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Ok(())
+        }
+    };
+
+    // (4) checkpoint memory/history to SQLite: a no-op today (see
+    // `converse_ex`'s doc comment — this loop does not yet wire history
+    // in, and every write that does happen elsewhere already commits
+    // synchronously through `HistoryStore`'s write actor, EPIC 10.1).
+    // (5) signal the STT/TTS workers to exit.
     let _ = stt_shutdown_tx.send(true);
     let _ = tts_shutdown_tx.send(true);
+    // (6) wait, bounded, for that to land; a still-running child is
+    // hard-killed by the supervisor's own shutdown path (EPIC 0.6), not by
+    // this function.
+    let _ = tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, tokio::time::sleep(Duration::from_millis(200))).await;
     soul_watch_cancel.cancel();
     let _ = soul_watch_handle.await;
+    if let Some(task) = control_task {
+        task.abort();
+    }
     result
 }
 
@@ -270,6 +363,7 @@ async fn run_loop(
     config: &Config,
     soul_watcher: &marceline_core::soul_watch::SoulWatcher,
     current_run: &CurrentRun,
+    state_tx: &watch::Sender<ConversationState>,
 ) -> Result<(), ConverseError> {
     let transcribe_timeout = Duration::from_millis(config.orchestrator.transcribe_timeout_ms);
     let think_timeout = Duration::from_millis(config.orchestrator.think_timeout_ms);
@@ -285,6 +379,7 @@ async fn run_loop(
         // clear the shared slot so a stray ctrl-c while idle just exits
         // (handled by the watcher) instead of cancelling nothing.
         *current_run.lock().expect("current_run lock poisoned") = None;
+        state_tx.send_replace(orchestrator.state());
         loop {
             let Ok(chunk) = capture.chunks().recv_timeout(WAKE_POLL_TIMEOUT) else {
                 continue;
@@ -295,6 +390,7 @@ async fn run_loop(
                     .apply(ConversationEvent::WakeWord)
                     .await
                     .expect("Idle always accepts WakeWord");
+                state_tx.send_replace(orchestrator.state());
                 break;
             }
         }
@@ -373,6 +469,7 @@ async fn run_loop(
             .apply(ConversationEvent::VadEnd)
             .await
             .expect("Listening always accepts VadEnd");
+        state_tx.send_replace(orchestrator.state());
 
         // TRANSCRIBING: worker-down surfaces as either a timeout here or
         // an `EngineError` from `transcribe` itself; both route through
@@ -420,6 +517,7 @@ async fn run_loop(
             .apply(ConversationEvent::FinalTranscript)
             .await
             .expect("Transcribing always accepts FinalTranscript");
+        state_tx.send_replace(orchestrator.state());
 
         // THINKING: only `Final` transcripts ever reach here (§2.4.1).
         // Recompiled from the watcher's latest persona every turn, so a
@@ -532,6 +630,7 @@ async fn run_loop(
             .apply(ConversationEvent::FirstTtsChunk)
             .await
             .expect("Thinking always accepts FirstTtsChunk");
+        state_tx.send_replace(orchestrator.state());
         playback.push(&first_chunk);
         let mut cancelled = false;
         while let Some(chunk) = audio.next().await {
@@ -573,6 +672,7 @@ async fn run_loop(
             .apply(ConversationEvent::PlaybackDone)
             .await
             .ok();
+        state_tx.send_replace(orchestrator.state());
     }
 }
 

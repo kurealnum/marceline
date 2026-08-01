@@ -10,6 +10,7 @@ use marceline_core::{Device, HealthView, Supervisor, WorkerSpec};
 use tokio::sync::{watch, RwLock};
 
 mod converse;
+mod lifecycle;
 mod memory;
 mod say;
 mod say_to_llm;
@@ -45,6 +46,13 @@ fn main() -> ExitCode {
         Some("converse") => runtime.block_on(run_converse(&args)),
         Some("config") => run_config(&args),
         Some("memory") => runtime.block_on(memory::run_memory(&args)),
+        Some(cmd @ ("start" | "stop" | "status")) => {
+            runtime.block_on(lifecycle::run_lifecycle(cmd, &args))
+        }
+        // Hidden: the actual daemon body `start` spawns detached via
+        // `setsid`. Not part of the documented command surface — an
+        // operator drives the daemon through `start`/`stop`/`status`.
+        Some("__daemon-run") => runtime.block_on(lifecycle::run_daemon_process(&args)),
         Some("--help") | Some("-h") => {
             print_usage();
             ExitCode::SUCCESS
@@ -68,7 +76,10 @@ fn print_usage() {
     eprintln!(
         "\
 Usage:
-  marceline                            Run the daemon
+  marceline                            Run the epic-0 stub worker (see `start` for the real daemon)
+  marceline start                      Start the daemon in the background
+  marceline stop                       Gracefully stop the running daemon
+  marceline status                     Show per-stage health and state of a running daemon
   marceline transcribe <file.wav>      Transcribe a wav file and print the text
   marceline say <text>                 Speak text aloud, per [tts] config
   marceline say-to-llm <text>          Stream an LLM reply to text, per [llm] config
