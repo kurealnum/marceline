@@ -91,7 +91,7 @@ Usage:
   marceline converse                   Run the full wake->listen->think->speak MVP loop
   marceline config get <key>           Print a config value
   marceline config set <key> <value>   Change a config value
-  marceline memory list                List stored long-term memories
+  marceline memory list                List recent turn history and long-term memories
   marceline memory search <query>      Find memories similar to a query
   marceline memory edit <id> <text>    Replace a memory's text and re-embed it
   marceline memory forget <id>         Delete a memory by row id
@@ -107,6 +107,7 @@ Options:
                       launching one from config (e.g. /tmp/marceline-stt.sock)
   --model-dir <path>  Embedding model directory for memory edit/search
   --k <n>             Result count for memory search (default 5)
+  --turns <n>         Turn history rows for memory list (default 20)
   --verbose           Debug-level logging",
         keys = SETTABLE_KEYS.join(", "),
         soul_default = say_to_llm::DEFAULT_SOUL,
