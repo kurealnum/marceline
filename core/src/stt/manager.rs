@@ -61,9 +61,11 @@ const MAX_LAUNCH_ATTEMPTS: u32 = 3;
 
 /// Where the STT worker lives on disk.
 ///
-/// Not in `config.toml`: these are properties of the checkout, not of how
-/// the user wants Marceline to run, and `[stt]` deliberately holds only the
-/// latter (§3.1).
+/// Not in `config.toml`: these are properties of where the workers live
+/// on disk (a dev checkout or a packaged install, resolved by
+/// [`crate::worker_paths::workers_root`], EPIC 12.1), not of how the user
+/// wants Marceline to run, and `[stt]` deliberately holds only the latter
+/// (§3.1).
 #[derive(Debug, Clone)]
 pub struct SttWorkerPaths {
     /// Python interpreter to run, normally the worker's venv.
@@ -81,7 +83,7 @@ impl SttWorkerPaths {
     /// the backend selects which script runs — the mechanism by which
     /// `[stt].backend` swaps implementations (EPIC 3.5).
     pub fn for_backend(backend: &str) -> Self {
-        let dir = PathBuf::from("workers").join(backend_dir(backend));
+        let dir = crate::worker_paths::workers_root().join(backend_dir(backend));
         Self {
             python: dir.join(".venv/bin/python"),
             script: dir.join("worker.py"),

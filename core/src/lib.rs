@@ -26,6 +26,7 @@ pub mod transcribe;
 pub mod tts;
 pub mod vad;
 pub mod wake;
+pub mod worker_paths;
 
 pub use audio::{
     read_wav, AudioChunk, Capture, CaptureError, LevelMeter, Playback, PlaybackError, WavReadError,
@@ -76,3 +77,4 @@ pub use tts::{
 };
 pub use vad::{SileroVad, VadEndpointer, VadError, DEFAULT_SPEECH_THRESHOLD, FRAME_SAMPLES};
 pub use wake::{EnergyWakeDetector, WakeDetector, WakeEngine, WakeEvent};
+pub use worker_paths::{workers_root, WORKERS_DIR_ENV_VAR};
