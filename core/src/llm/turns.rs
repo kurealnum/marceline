@@ -100,6 +100,17 @@ impl TurnBuffer {
         }
     }
 
+    /// A turn buffer pre-seeded with `turns` (e.g. from
+    /// [`crate::context::recent_context`], EPIC 10.2) instead of starting
+    /// empty — how a restarted daemon resumes mid-session with the working
+    /// context it had before going down.
+    pub fn from_turns(turns: Vec<Message>) -> Self {
+        Self {
+            turns,
+            trim_policy: Box::new(DropOldestTurn),
+        }
+    }
+
     /// Appends a user turn.
     pub fn push_user(&mut self, text: impl Into<String>) {
         self.turns.push(Message::new(Role::User, text));
