@@ -231,14 +231,21 @@ pub async fn converse_ex(
     let (stt_shutdown_tx, stt_shutdown_rx) = watch::channel(false);
     let stt_health: HealthView = Arc::new(RwLock::new(HashMap::new()));
     let stt_health_for_status = Arc::clone(&stt_health);
-    let _stt_launch = SttManager::start(
-        &config.stt,
-        stt_paths,
-        stt_health,
-        stt_shutdown_rx,
-        CancellationToken::new(),
-    )
-    .await?;
+    // Wrapped in `Arc` so daemon mode's control socket (EPIC 11.2's live
+    // `config set stt.model`/`stt.backend` swap) can hold its own handle
+    // onto the same manager `run_loop` connects fresh clients to each
+    // turn — `swap_model` takes `&self`, so both sides can call it
+    // concurrently without extra locking here.
+    let stt_manager = Arc::new(
+        SttManager::start(
+            &config.stt,
+            stt_paths,
+            stt_health,
+            stt_shutdown_rx,
+            CancellationToken::new(),
+        )
+        .await?,
+    );
 
     let tts_paths = TtsWorkerPaths::for_backend(&config.tts.backend);
     let tts_socket = tts_paths.socket_path.clone();
@@ -262,10 +269,16 @@ pub async fn converse_ex(
     let (state_tx, state_rx) = watch::channel(ConversationState::Idle);
     let control_task = control_socket.map(|socket_path| {
         let socket_path = socket_path.to_path_buf();
+        let stt_manager_for_status = Arc::clone(&stt_manager);
         tokio::spawn(async move {
-            if let Err(err) =
-                marceline_core::daemon::serve_status(&socket_path, stt_health_for_status, tts_health_for_status, state_rx)
-                    .await
+            if let Err(err) = marceline_core::daemon::serve_control(
+                &socket_path,
+                stt_health_for_status,
+                tts_health_for_status,
+                state_rx,
+                Some(stt_manager_for_status),
+            )
+            .await
             {
                 tracing::error!(%err, "control socket stopped serving");
             }

@@ -264,6 +264,10 @@ async fn run_status(pidfile: &Path, control_socket: &Path) -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        Ok(other) => {
+            eprintln!("marceline process is running (pid {pid}) but sent an unexpected reply: {other:?}");
+            ExitCode::FAILURE
+        }
         Err(err) => {
             eprintln!("marceline process is running (pid {pid}) but did not answer status: {err}");
             ExitCode::FAILURE
