@@ -13,6 +13,7 @@ mod converse;
 mod memory;
 mod say;
 mod say_to_llm;
+mod setup;
 mod transcribe;
 
 /// Default config file, relative to the working directory. The full
@@ -45,6 +46,7 @@ fn main() -> ExitCode {
         Some("converse") => runtime.block_on(run_converse(&args)),
         Some("config") => run_config(&args),
         Some("memory") => runtime.block_on(memory::run_memory(&args)),
+        Some("setup") => runtime.block_on(setup::run_setup(&args)),
         Some("--help") | Some("-h") => {
             print_usage();
             ExitCode::SUCCESS
@@ -69,6 +71,7 @@ fn print_usage() {
         "\
 Usage:
   marceline                            Run the daemon
+  marceline setup                      First-run: scaffold config.toml/SOUL.md, warm default models
   marceline transcribe <file.wav>      Transcribe a wav file and print the text
   marceline say <text>                 Speak text aloud, per [tts] config
   marceline say-to-llm <text>          Stream an LLM reply to text, per [llm] config

@@ -34,7 +34,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -298,6 +298,10 @@ async fn run_loop(
                 break;
             }
         }
+        // Wake→first-audio latency (SPEC.md §9.2, §10, EPIC 12.3) is
+        // timed from here — the wake word firing is the perceived start
+        // of a turn, the moment the target's "≤1.5s" is measured against.
+        let wake_at = Instant::now();
 
         // One run token for the whole turn (§2.5.1): minted by `apply`
         // above, published here so `ctrl-c` can reach it, and cloned into
@@ -373,6 +377,7 @@ async fn run_loop(
             .apply(ConversationEvent::VadEnd)
             .await
             .expect("Listening always accepts VadEnd");
+        let vad_end_at = Instant::now();
 
         // TRANSCRIBING: worker-down surfaces as either a timeout here or
         // an `EngineError` from `transcribe` itself; both route through
@@ -420,6 +425,7 @@ async fn run_loop(
             .apply(ConversationEvent::FinalTranscript)
             .await
             .expect("Transcribing always accepts FinalTranscript");
+        let transcript_ready_at = Instant::now();
 
         // THINKING: only `Final` transcripts ever reach here (§2.4.1).
         // Recompiled from the watcher's latest persona every turn, so a
@@ -443,8 +449,15 @@ async fn run_loop(
         // the "first TTS chunk" trigger, so the transition into Speaking
         // is driven by actually having something to say, not by entering
         // Thinking. A stuck/dead LLM shows up here as a timeout.
+        // Every other arm of this match `continue`s the turn loop, so this
+        // is guaranteed assigned by the time it's read below (SPEC.md
+        // §12.3's `llm_first_sentence_ms` boundary).
+        let llm_first_sentence_at;
         let first_sentence = match tokio::time::timeout(think_timeout, sentences.next()).await {
-            Ok(Some(Ok(text))) => text,
+            Ok(Some(Ok(text))) => {
+                llm_first_sentence_at = Instant::now();
+                text
+            }
             Ok(Some(Err(err))) => {
                 let _ = orchestrator
                     .apply(ConversationEvent::StageError {
@@ -493,8 +506,14 @@ async fn run_loop(
             voice,
         );
         let mut audio = tts.synthesize(text_stream, resolved_voice).await;
+        // Same guarantee as `llm_first_sentence_at` above: every other arm
+        // `continue`s the turn loop.
+        let tts_first_chunk_at;
         let first_chunk = match tokio::time::timeout(speak_timeout, audio.next()).await {
-            Ok(Some(Ok(chunk))) => chunk,
+            Ok(Some(Ok(chunk))) => {
+                tts_first_chunk_at = Instant::now();
+                chunk
+            }
             Ok(Some(Err(err))) => {
                 let _ = orchestrator
                     .apply(ConversationEvent::StageError {
@@ -532,6 +551,32 @@ async fn run_loop(
             .apply(ConversationEvent::FirstTtsChunk)
             .await
             .expect("Thinking always accepts FirstTtsChunk");
+
+        // Wake→first-audio latency (SPEC.md §9.2, §10, EPIC 12.3): every
+        // instant here was captured at a state-machine boundary this turn
+        // already crossed, so this is a few `Instant::now()` calls' worth
+        // of overhead added to the whole turn, not something that stalls
+        // the streaming path it measures. Logged as a structured event
+        // (queryable via `RUST_LOG`/`MARCELINE_LOG` target filtering, and
+        // over `marceline logs`, EPIC 11.5) — nothing yet asserts the
+        // ≤1.5s target itself; that's EPIC 12.4's canned-audio harness.
+        let latency = marceline_core::TurnLatencyMs::from_instants(
+            wake_at,
+            vad_end_at,
+            transcript_ready_at,
+            llm_first_sentence_at,
+            tts_first_chunk_at,
+        );
+        tracing::info!(
+            vad_tail_ms = latency.vad_tail_ms,
+            stt_ms = latency.stt_ms,
+            llm_first_sentence_ms = latency.llm_first_sentence_ms,
+            tts_first_chunk_ms = latency.tts_first_chunk_ms,
+            total_ms = latency.total_ms,
+            meets_target = latency.meets_target(),
+            "turn latency"
+        );
+
         playback.push(&first_chunk);
         let mut cancelled = false;
         while let Some(chunk) = audio.next().await {
@@ -585,5 +630,400 @@ pub fn soul_path_from_args(args: &[String]) -> PathBuf {
     match index.and_then(|i| args.get(i + 1)) {
         Some(path) => PathBuf::from(path),
         None => PathBuf::from(DEFAULT_SOUL),
+    }
+}
+
+/// Canned-audio integration test (EPIC 12.4): drives `run_loop` — the
+/// exact function `marceline converse` runs — end to end against a
+/// pre-recorded wav file instead of a live mic, with fake STT/TTS/LLM
+/// servers standing in for the real Python workers and external LLM.
+///
+/// What's real: the wake/VAD gate (`Gate`, real Silero ONNX inference),
+/// `Capture::from_wav_file` feeding it, `Playback::null` draining
+/// synthesized audio, and every bit of orchestration in between —
+/// `run_loop` itself is not special-cased for testing at all. What's
+/// faked: the STT/TTS workers (real gRPC servers over real unix sockets,
+/// speaking the exact `marceline_protocol` contract the Python workers
+/// do — see `core/tests/{common,tts_common}` for the precedent this
+/// mirrors) and the LLM (a real HTTP server speaking the OpenAI SSE
+/// format, mirroring `core/tests/llm_integration.rs`). No CUDA, no
+/// Python venv, no network — runnable headlessly in CI (this story's
+/// "Done when").
+#[cfg(test)]
+mod canned_audio_tests {
+    use super::*;
+    use std::convert::Infallible;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use bytes::Bytes;
+    use http_body_util::{BodyExt, StreamBody};
+    use hyper::body::Frame;
+    use hyper::service::service_fn;
+    use hyper::Response as HyperResponse;
+    use hyper_util::rt::TokioIo;
+    use marceline_protocol::common::AudioChunk as ProtoAudioChunk;
+    use marceline_protocol::stt::stt_server::{Stt, SttServer};
+    use marceline_protocol::stt::{
+        stt_response, FinalTranscript, SttInfo, SttInfoRequest, SttRequest, SttResponse,
+    };
+    use marceline_protocol::tts::tts_server::{Tts, TtsServer};
+    use marceline_protocol::tts::{TtsInfo, TtsInfoRequest, TtsRequest, TtsResponse};
+    use tokio::net::{TcpListener, UnixListener};
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
+    use tonic::{Request, Response, Status, Streaming};
+
+    static SOCKET_SEQ: AtomicU32 = AtomicU32::new(0);
+
+    fn unique_socket_path(name: &str) -> PathBuf {
+        let n = SOCKET_SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "marceline-canned-audio-test-{}-{n}-{name}.sock",
+            std::process::id()
+        ))
+    }
+
+    /// Fake `Stt` worker: consumes whatever audio it's sent and always
+    /// answers with one fixed final transcript — the content of the
+    /// canned wav doesn't need to be a real recognizable sentence for
+    /// this harness to prove the pipeline wiring works end to end;
+    /// `core/tests/vad_integration.rs`'s real-speech fixture only needs
+    /// to be *speech-like enough* to drive the wake/VAD gate for real.
+    struct FakeStt {
+        transcript: String,
+    }
+
+    #[tonic::async_trait]
+    impl Stt for FakeStt {
+        type TranscribeStream = ReceiverStream<Result<SttResponse, Status>>;
+
+        async fn transcribe(
+            &self,
+            request: Request<Streaming<SttRequest>>,
+        ) -> Result<Response<Self::TranscribeStream>, Status> {
+            let mut inbound = request.into_inner();
+            let transcript = self.transcript.clone();
+            let (tx, rx) = mpsc::channel(4);
+            tokio::spawn(async move {
+                while let Some(Ok(_msg)) = inbound.next().await {}
+                let _ = tx
+                    .send(Ok(SttResponse {
+                        transcript: Some(stt_response::Transcript::Final(FinalTranscript {
+                            text: transcript,
+                            confidence: 0.98,
+                            no_speech_prob: Some(0.01),
+                            avg_logprob: Some(-0.1),
+                        })),
+                    }))
+                    .await;
+            });
+            Ok(Response::new(ReceiverStream::new(rx)))
+        }
+
+        async fn get_info(&self, _: Request<SttInfoRequest>) -> Result<Response<SttInfo>, Status> {
+            Ok(Response::new(SttInfo {
+                name: "fake-stt".to_string(),
+                langs: vec!["en".to_string()],
+                input_sample_rate: 16_000,
+                partials: false,
+            }))
+        }
+    }
+
+    /// Starts a fake STT worker on its own unix socket, returning the
+    /// socket path `SttManager::attach` dials.
+    async fn start_fake_stt(transcript: &str) -> PathBuf {
+        let path = unique_socket_path("stt");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind fake stt socket");
+        let worker = FakeStt {
+            transcript: transcript.to_string(),
+        };
+        tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(SttServer::new(worker))
+                .serve_with_incoming(UnixListenerStream::new(listener))
+                .await;
+        });
+        path
+    }
+
+    /// Fake `Tts` worker: answers every synthesize request with one fixed
+    /// audio chunk, and records every text span it was asked to speak so
+    /// the test can assert the LLM's reply actually reached TTS.
+    struct FakeTts {
+        received: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[tonic::async_trait]
+    impl Tts for FakeTts {
+        type SynthesizeStream = ReceiverStream<Result<TtsResponse, Status>>;
+
+        async fn synthesize(
+            &self,
+            request: Request<Streaming<TtsRequest>>,
+        ) -> Result<Response<Self::SynthesizeStream>, Status> {
+            let mut inbound = request.into_inner();
+            let received = Arc::clone(&self.received);
+            let (tx, rx) = mpsc::channel(4);
+            tokio::spawn(async move {
+                while let Some(Ok(msg)) = inbound.next().await {
+                    if let Some(marceline_protocol::tts::tts_request::Payload::Text(text)) =
+                        msg.payload
+                    {
+                        received.lock().expect("received lock poisoned").push(text);
+                    }
+                }
+                let _ = tx
+                    .send(Ok(TtsResponse {
+                        audio: Some(ProtoAudioChunk {
+                            seq: 0,
+                            pcm: vec![0.1; 800],
+                            sample_rate: 24_000,
+                            channels: 1,
+                        }),
+                    }))
+                    .await;
+            });
+            Ok(Response::new(ReceiverStream::new(rx)))
+        }
+
+        async fn get_info(&self, _: Request<TtsInfoRequest>) -> Result<Response<TtsInfo>, Status> {
+            Ok(Response::new(TtsInfo {
+                name: "fake-tts".to_string(),
+                voices: vec!["af_sky".to_string()],
+                output_sample_rate: 24_000,
+            }))
+        }
+    }
+
+    /// Starts a fake TTS worker on its own unix socket, returning the
+    /// socket path and the shared log of text spans it received.
+    async fn start_fake_tts() -> (PathBuf, Arc<Mutex<Vec<String>>>) {
+        let path = unique_socket_path("tts");
+        let _ = std::fs::remove_file(&path);
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let listener = UnixListener::bind(&path).expect("bind fake tts socket");
+        let worker = FakeTts {
+            received: Arc::clone(&received),
+        };
+        tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(TtsServer::new(worker))
+                .serve_with_incoming(UnixListenerStream::new(listener))
+                .await;
+        });
+        (path, received)
+    }
+
+    /// Starts a fake OpenAI-compatible SSE server (mirroring
+    /// `core/tests/llm_integration.rs`'s `start_fake_server`) that always
+    /// replies with one fixed sentence, and returns its base URL.
+    async fn start_fake_llm(reply: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let line = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":{reply:?}}},\"finish_reason\":null}}]}}\n\n\
+             data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\n\
+             data: [DONE]\n\n"
+        );
+
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(accepted) => accepted,
+                    Err(_) => return,
+                };
+                let io = TokioIo::new(stream);
+                let line = line.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |_req| {
+                        let body = Bytes::from(line.clone());
+                        async move {
+                            let stream = futures::stream::once(async move {
+                                Ok::<_, Infallible>(Frame::data(body))
+                            });
+                            Ok::<_, Infallible>(
+                                HyperResponse::builder()
+                                    .status(200)
+                                    .header("content-type", "text/event-stream")
+                                    .body(BodyExt::boxed(StreamBody::new(stream)))
+                                    .expect("build response"),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, service)
+                        .await;
+                });
+            }
+        });
+
+        format!("http://{addr}/v1")
+    }
+
+    /// Builds a canned wav: the repo's real-speech VAD fixture
+    /// (`core/tests/fixtures/speech_sample.wav`, 16kHz mono — real enough
+    /// audio to drive the wake/VAD gate for real, per
+    /// `core/tests/vad_integration.rs`) followed by enough trailing
+    /// silence for the VAD to endpoint the utterance
+    /// (`[vad].silence_ms`).
+    fn build_canned_wav(dest: &Path) {
+        let fixture = format!(
+            "{}/../core/tests/fixtures/speech_sample.wav",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let mut reader = hound::WavReader::open(&fixture).expect("open speech fixture");
+        let mut samples: Vec<f32> = reader
+            .samples::<i16>()
+            .map(|s| s.expect("decode sample") as f32 / i16::MAX as f32)
+            .collect();
+        // 1.5s of trailing silence: comfortably past `[vad].silence_ms`
+        // (700ms default) so the gate reliably endpoints the utterance.
+        samples.extend(std::iter::repeat_n(0.0f32, 16_000 * 3 / 2));
+
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut writer = hound::WavWriter::create(dest, spec).expect("create canned wav");
+        for s in samples {
+            writer.write_sample(s).expect("write sample");
+        }
+        writer.finalize().expect("finalize canned wav");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_canned_audio_turn_produces_a_transcript_and_a_spoken_response() {
+        let stt_socket = start_fake_stt("what's the weather like").await;
+        let (tts_socket, tts_received) = start_fake_tts().await;
+        let llm_base_url = start_fake_llm("It's sunny today.").await;
+
+        let env_var = "MARCELINE_CANNED_AUDIO_TEST_LLM_KEY";
+        std::env::set_var(env_var, "test-key");
+
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        std::fs::write(&config_path, crate::setup::DEFAULT_CONFIG_TOML).unwrap();
+        marceline_core::config_edit::set_string(&config_path, "llm.base_url", &llm_base_url)
+            .unwrap();
+        marceline_core::config_edit::set_string(&config_path, "llm.api_key_env", env_var).unwrap();
+        let mut config = Config::load(&config_path).expect("load canned-audio test config");
+        // Generous but bounded: real timeouts, just wide enough that a
+        // loaded CI runner never trips them on a fake server that answers
+        // near-instantly anyway.
+        config.orchestrator.transcribe_timeout_ms = 10_000;
+        config.orchestrator.think_timeout_ms = 10_000;
+        config.orchestrator.speak_timeout_ms = 10_000;
+
+        let detector = EnergyWakeDetector::new(config.wake.sensitivity, 16_000, 1600);
+        let wake = marceline_core::WakeEngine::new(&config.wake, Box::new(detector));
+        let model_path = format!("{}/models/silero_vad.onnx", env!("CARGO_MANIFEST_DIR"));
+        let vad = SileroVad::load(&model_path).expect("load silero vad model");
+        let endpointer = VadEndpointer::new(vad, DEFAULT_SPEECH_THRESHOLD);
+        let mut gate = Gate::new(wake, endpointer, &config.vad);
+
+        let wav_path = config_dir.path().join("canned.wav");
+        build_canned_wav(&wav_path);
+        let capture = marceline_core::audio::Capture::from_wav_file(&wav_path, 1.5, 1600)
+            .expect("build canned Capture");
+        let playback = marceline_core::Playback::null(24_000, 1);
+
+        let soul_path = config_dir.path().join("SOUL.md");
+        std::fs::write(&soul_path, "# Identity\n\nTest persona for the canned-audio harness.\n")
+            .unwrap();
+        let soul_watch_cancel = CancellationToken::new();
+        let (soul_watcher, soul_watch_handle) = marceline_core::soul_watch::watch(
+            soul_path,
+            Duration::from_secs(3600),
+            soul_watch_cancel.clone(),
+        );
+
+        let current_run: CurrentRun = Arc::new(Mutex::new(None));
+        let voice = VoiceId::from("af_sky");
+
+        // EPIC 12.3's real per-turn wake→first-audio timestamps are
+        // captured *inside* `run_loop` and only ever leave it via a
+        // tracing log line — there is no return value or channel this
+        // test can read them from. `turn_start` is a proxy measured from
+        // outside instead: real-world clock time from just before the
+        // gate starts consuming the canned wav to the fake TTS server
+        // receiving text. It is not exactly wake→first-audio (it also
+        // includes however long the gate takes to consume the fixture's
+        // leading frames before `EnergyWakeDetector` fires), but it is
+        // the same order of magnitude and regresses the same way a real
+        // slowdown would, which is what a CI assertion needs.
+        let turn_start = Instant::now();
+
+        // `run_loop` is `?Send` throughout (its `Stages` impl uses
+        // `#[async_trait(?Send)]`, per this file's module docs), so it
+        // cannot be `tokio::spawn`ed — `select!` polls it and the
+        // assertion below within this same task instead, which needs no
+        // `Send` bound at all. `run_loop` never returns on its own (it's
+        // `'turn: loop { ... }`), so whichever branch finishes first is
+        // always the assertion; the dropped `run_loop` future is simply
+        // never polled again, same effect as an abort.
+        let wait_for_tts = async {
+            // Poll for the fake TTS server to have received the LLM's
+            // reply — this is the harness's "a response was produced"
+            // assertion: it can only have that text if wake fired, VAD
+            // endpointed the utterance, the fake STT's transcript reached
+            // the LLM, and the LLM's streamed reply reached TTS, in that
+            // order, through the real `run_loop`.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                if !tts_received.lock().expect("received lock poisoned").is_empty() {
+                    return;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "timed out waiting for a turn to reach TTS"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+
+        tokio::select! {
+            result = run_loop(
+                &mut gate,
+                &capture,
+                &playback,
+                &stt_socket,
+                &tts_socket,
+                "en",
+                &voice,
+                &config,
+                &soul_watcher,
+                &current_run,
+            ) => {
+                panic!("run_loop returned unexpectedly: {result:?}");
+            }
+            _ = wait_for_tts => {}
+        }
+
+        let spoken = tts_received.lock().expect("received lock poisoned").clone();
+        assert!(
+            spoken.iter().any(|text| text.contains("sunny")),
+            "expected the LLM's reply to reach TTS, got {spoken:?}"
+        );
+
+        // EPIC 12.3's ≤1.5s wake→first-audio target, asserted against the
+        // proxy timing documented above — this is the CI check that
+        // story's own doc comment named as EPIC 12.4's job. A fake
+        // STT/TTS/LLM stack answering near-instantly should clear the
+        // real target with room to spare; if this ever starts flaking on
+        // CI hardware, the target is what needs revisiting, not this
+        // assertion.
+        let elapsed_ms = turn_start.elapsed().as_millis() as u64;
+        assert!(
+            elapsed_ms <= marceline_core::MAX_WAKE_TO_FIRST_AUDIO_MS,
+            "canned-audio turn took {elapsed_ms}ms, over the {}ms wake→first-audio target",
+            marceline_core::MAX_WAKE_TO_FIRST_AUDIO_MS
+        );
+
+        soul_watch_cancel.cancel();
+        let _ = soul_watch_handle.await;
     }
 }

@@ -10,6 +10,7 @@ pub mod engine;
 pub mod gate;
 pub mod history;
 pub mod ipc;
+pub mod latency;
 pub mod llm;
 pub mod logging;
 pub mod mcp;
@@ -26,6 +27,7 @@ pub mod transcribe;
 pub mod tts;
 pub mod vad;
 pub mod wake;
+pub mod worker_paths;
 
 pub use audio::{
     read_wav, AudioChunk, Capture, CaptureError, LevelMeter, Playback, PlaybackError, WavReadError,
@@ -39,6 +41,7 @@ pub use embedding::{EmbedError, EmbeddingPipeline, MiniLmEmbedder, MINILM_DIM};
 pub use engine::{AudioStream, EngineError};
 pub use gate::{Gate, GateOutput, GateState};
 pub use history::{HistoryError, HistoryStore, MemoryRecord, NewMemory, NewTurn, TurnRecord};
+pub use latency::{TurnLatencyMs, MAX_WAKE_TO_FIRST_AUDIO_MS};
 pub use llm::{
     compile_system_prompt, ChatEvent, ChatEventStream, ChatRequest, DropOldestTurn, FinishReason,
     LlmEngine, LlmInfo, MemoryEntry, Message, OpenAiCompatibleEngine, Role, SessionGuard,
@@ -76,3 +79,4 @@ pub use tts::{
 };
 pub use vad::{SileroVad, VadEndpointer, VadError, DEFAULT_SPEECH_THRESHOLD, FRAME_SAMPLES};
 pub use wake::{EnergyWakeDetector, WakeDetector, WakeEngine, WakeEvent};
+pub use worker_paths::{workers_root, WORKERS_DIR_ENV_VAR};
