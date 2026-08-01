@@ -76,6 +76,15 @@ pub enum ControlRequest {
     /// `marceline status`: report per-stage health and the current
     /// conversation state.
     Status,
+    /// `marceline config set stt.model`/`stt.backend` (EPIC 11.2): restart
+    /// the STT worker on a new model/backend without a full daemon
+    /// restart. `backend` is `None` when only the model id changes.
+    SwapSttModel {
+        /// The new model id to load.
+        model: String,
+        /// The new STT backend, if it's changing too.
+        backend: Option<String>,
+    },
 }
 
 /// Health of one supervised stage, as reported over the wire — a
@@ -153,6 +162,18 @@ pub struct StatusReport {
 pub enum ControlResponse {
     /// Reply to [`ControlRequest::Status`].
     Status(StatusReport),
+    /// Reply to a successful [`ControlRequest::SwapSttModel`], carrying the
+    /// model id the worker actually reports having loaded.
+    Swapped {
+        /// Model id reported by the freshly (re)loaded worker.
+        model: String,
+    },
+    /// Reply to a failed [`ControlRequest::SwapSttModel`] — e.g. the
+    /// worker never came back healthy on the new model/backend.
+    SwapFailed {
+        /// Human-readable reason the swap failed.
+        reason: String,
+    },
 }
 
 /// Errors talking to the control socket.
@@ -208,7 +229,11 @@ pub async fn send_request(
 }
 
 /// Serves the control socket at `socket_path` forever, answering
-/// [`ControlRequest::Status`] from `stt_health`/`tts_health` and `state`.
+/// [`ControlRequest::Status`] from `stt_health`/`tts_health` and `state`,
+/// and [`ControlRequest::SwapSttModel`] via `stt` (when present — a `None`
+/// `stt` answers every swap request with [`ControlResponse::SwapFailed`],
+/// which should not happen in practice since the daemon always has one,
+/// but keeps this function callable from tests that don't).
 ///
 /// Meant to run as a background task for the lifetime of the daemon
 /// process (spawned by `cli::converse`'s daemon mode); shutdown happens
@@ -220,11 +245,12 @@ pub async fn send_request(
 /// unclean previous exit is removed first, since `UnixListener::bind`
 /// fails with `AddrInUse` on an existing path even if nothing is listening
 /// on it.
-pub async fn serve_status(
+pub async fn serve_control(
     socket_path: &Path,
     stt_health: HealthView,
     tts_health: HealthView,
     state: watch::Receiver<ConversationState>,
+    stt: Option<std::sync::Arc<crate::stt::SttManager>>,
 ) -> io::Result<()> {
     let _ = std::fs::remove_file(socket_path);
     let listener = tokio::net::UnixListener::bind(socket_path)?;
@@ -234,6 +260,7 @@ pub async fn serve_status(
         let stt_health = stt_health.clone();
         let tts_health = tts_health.clone();
         let state = state.clone();
+        let stt = stt.clone();
         tokio::spawn(async move {
             let (read_half, mut write_half) = stream.into_split();
             let mut reader = BufReader::new(read_half);
@@ -241,31 +268,45 @@ pub async fn serve_status(
             if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
                 return;
             }
-            let Ok(ControlRequest::Status) = serde_json::from_str::<ControlRequest>(line.trim_end())
-            else {
+            let Ok(request) = serde_json::from_str::<ControlRequest>(line.trim_end()) else {
                 return;
             };
 
-            let mut workers: Vec<(String, StageHealth)> = stt_health
-                .read()
-                .await
-                .iter()
-                .map(|(name, s)| (name.clone(), StageHealth::from(*s)))
-                .collect();
-            workers.extend(
-                tts_health
-                    .read()
-                    .await
-                    .iter()
-                    .map(|(name, s)| (name.clone(), StageHealth::from(*s))),
-            );
-
-            let report = StatusReport {
-                workers,
-                state: WireConversationState::from(*state.borrow()),
+            let response = match request {
+                ControlRequest::Status => {
+                    let mut workers: Vec<(String, StageHealth)> = stt_health
+                        .read()
+                        .await
+                        .iter()
+                        .map(|(name, s)| (name.clone(), StageHealth::from(*s)))
+                        .collect();
+                    workers.extend(
+                        tts_health
+                            .read()
+                            .await
+                            .iter()
+                            .map(|(name, s)| (name.clone(), StageHealth::from(*s))),
+                    );
+                    ControlResponse::Status(StatusReport {
+                        workers,
+                        state: WireConversationState::from(*state.borrow()),
+                    })
+                }
+                ControlRequest::SwapSttModel { model, backend } => match stt {
+                    Some(stt) => match stt.swap_model(&model, backend.as_deref()).await {
+                        Ok(info) => ControlResponse::Swapped { model: info.name },
+                        Err(err) => ControlResponse::SwapFailed {
+                            reason: err.to_string(),
+                        },
+                    },
+                    None => ControlResponse::SwapFailed {
+                        reason: "no STT worker is running in this daemon".to_string(),
+                    },
+                },
             };
-            let mut out = serde_json::to_string(&ControlResponse::Status(report))
-                .expect("StatusReport always serializes");
+
+            let mut out =
+                serde_json::to_string(&response).expect("ControlResponse always serializes");
             out.push('\n');
             let _ = write_half.write_all(out.as_bytes()).await;
             let _ = write_half.flush().await;
@@ -315,14 +356,17 @@ mod tests {
 
         let socket_for_server = socket_path.clone();
         tokio::spawn(async move {
-            let _ = serve_status(&socket_for_server, stt_health, tts_health, state_rx).await;
+            let _ = serve_control(&socket_for_server, stt_health, tts_health, state_rx, None).await;
         });
         // Give the listener a moment to bind before dialing it.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let ControlResponse::Status(report) = send_request(&socket_path, &ControlRequest::Status)
+        let response = send_request(&socket_path, &ControlRequest::Status)
             .await
             .unwrap();
+        let ControlResponse::Status(report) = response else {
+            panic!("expected a Status response, got {response:?}");
+        };
 
         assert_eq!(report.state, WireConversationState::Listening);
         assert!(report
