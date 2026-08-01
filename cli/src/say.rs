@@ -1,9 +1,14 @@
-//! The `marceline say <text>` path (EPIC 5, demoable).
+//! The `marceline say <text>` path (EPIC 5, demoable; EPIC 11.4's
+//! isolated-TTS-stage-test half of the CLI control surface).
 //!
 //! Speaks `text` aloud through the configured `[tts]` backend and writes
 //! what it spoke to a `.wav` file, so the epic's demo is checkable from the
 //! command line: change `[tts].backend` from `kokoro` to `piper`, rerun the
 //! same text, and it still speaks — on the new backend, no code change.
+//! This is the same [`TtsEngine`] trait impl the daemon's conversation
+//! loop drives (`cli::converse`), so a passing `say` run against a given
+//! `[tts]` config means that stage works in the real pipeline too — no
+//! separate test-only code path to fall out of sync with it.
 //!
 //! Unlike `say-to-llm`, this does not touch the LLM: `text` goes straight
 //! to TTS as a single already-segmented span, the same shape sentence-
