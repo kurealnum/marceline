@@ -34,7 +34,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -298,6 +298,10 @@ async fn run_loop(
                 break;
             }
         }
+        // Wake→first-audio latency (SPEC.md §9.2, §10, EPIC 12.3) is
+        // timed from here — the wake word firing is the perceived start
+        // of a turn, the moment the target's "≤1.5s" is measured against.
+        let wake_at = Instant::now();
 
         // One run token for the whole turn (§2.5.1): minted by `apply`
         // above, published here so `ctrl-c` can reach it, and cloned into
@@ -373,6 +377,7 @@ async fn run_loop(
             .apply(ConversationEvent::VadEnd)
             .await
             .expect("Listening always accepts VadEnd");
+        let vad_end_at = Instant::now();
 
         // TRANSCRIBING: worker-down surfaces as either a timeout here or
         // an `EngineError` from `transcribe` itself; both route through
@@ -420,6 +425,7 @@ async fn run_loop(
             .apply(ConversationEvent::FinalTranscript)
             .await
             .expect("Transcribing always accepts FinalTranscript");
+        let transcript_ready_at = Instant::now();
 
         // THINKING: only `Final` transcripts ever reach here (§2.4.1).
         // Recompiled from the watcher's latest persona every turn, so a
@@ -443,8 +449,15 @@ async fn run_loop(
         // the "first TTS chunk" trigger, so the transition into Speaking
         // is driven by actually having something to say, not by entering
         // Thinking. A stuck/dead LLM shows up here as a timeout.
+        // Every other arm of this match `continue`s the turn loop, so this
+        // is guaranteed assigned by the time it's read below (SPEC.md
+        // §12.3's `llm_first_sentence_ms` boundary).
+        let llm_first_sentence_at;
         let first_sentence = match tokio::time::timeout(think_timeout, sentences.next()).await {
-            Ok(Some(Ok(text))) => text,
+            Ok(Some(Ok(text))) => {
+                llm_first_sentence_at = Instant::now();
+                text
+            }
             Ok(Some(Err(err))) => {
                 let _ = orchestrator
                     .apply(ConversationEvent::StageError {
@@ -493,8 +506,14 @@ async fn run_loop(
             voice,
         );
         let mut audio = tts.synthesize(text_stream, resolved_voice).await;
+        // Same guarantee as `llm_first_sentence_at` above: every other arm
+        // `continue`s the turn loop.
+        let tts_first_chunk_at;
         let first_chunk = match tokio::time::timeout(speak_timeout, audio.next()).await {
-            Ok(Some(Ok(chunk))) => chunk,
+            Ok(Some(Ok(chunk))) => {
+                tts_first_chunk_at = Instant::now();
+                chunk
+            }
             Ok(Some(Err(err))) => {
                 let _ = orchestrator
                     .apply(ConversationEvent::StageError {
@@ -532,6 +551,32 @@ async fn run_loop(
             .apply(ConversationEvent::FirstTtsChunk)
             .await
             .expect("Thinking always accepts FirstTtsChunk");
+
+        // Wake→first-audio latency (SPEC.md §9.2, §10, EPIC 12.3): every
+        // instant here was captured at a state-machine boundary this turn
+        // already crossed, so this is a few `Instant::now()` calls' worth
+        // of overhead added to the whole turn, not something that stalls
+        // the streaming path it measures. Logged as a structured event
+        // (queryable via `RUST_LOG`/`MARCELINE_LOG` target filtering, and
+        // over `marceline logs`, EPIC 11.5) — nothing yet asserts the
+        // ≤1.5s target itself; that's EPIC 12.4's canned-audio harness.
+        let latency = marceline_core::TurnLatencyMs::from_instants(
+            wake_at,
+            vad_end_at,
+            transcript_ready_at,
+            llm_first_sentence_at,
+            tts_first_chunk_at,
+        );
+        tracing::info!(
+            vad_tail_ms = latency.vad_tail_ms,
+            stt_ms = latency.stt_ms,
+            llm_first_sentence_ms = latency.llm_first_sentence_ms,
+            tts_first_chunk_ms = latency.tts_first_chunk_ms,
+            total_ms = latency.total_ms,
+            meets_target = latency.meets_target(),
+            "turn latency"
+        );
+
         playback.push(&first_chunk);
         let mut cancelled = false;
         while let Some(chunk) = audio.next().await {
