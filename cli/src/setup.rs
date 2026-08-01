@@ -48,7 +48,7 @@ use crate::converse;
 /// The starter `config.toml` this repo ships and tests against (SPEC.md
 /// §3.1) — embedded at compile time so a packaged install (EPIC 12.1) has
 /// it without needing the source tree around at runtime.
-const DEFAULT_CONFIG_TOML: &str = include_str!("../../config.toml");
+pub(crate) const DEFAULT_CONFIG_TOML: &str = include_str!("../../config.toml");
 
 /// The starter `SOUL.md` template (SPEC.md §3.2's six suggested
 /// sections, matching the exact heading text `core::soul::Section`

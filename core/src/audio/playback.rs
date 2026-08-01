@@ -9,6 +9,7 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, Stream, StreamConfig};
@@ -16,6 +17,11 @@ use cpal::{FromSample, Sample, SampleFormat, Stream, StreamConfig};
 use super::device_select::resolve;
 use super::resample;
 use super::AudioChunk;
+
+/// How often [`Playback::null`]'s background task drains the ring —
+/// frequent enough that `while buffered_samples() > 0 { sleep }` callers
+/// (e.g. `cli::converse`'s run loop) don't wait long, without spinning.
+const NULL_DRAIN_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Errors that can occur while starting playback.
 #[derive(Debug, thiserror::Error)]
@@ -45,7 +51,9 @@ type PlaybackRing = Arc<Mutex<VecDeque<f32>>>;
 /// Live PCM playback: owns the `cpal` output stream and a playback ring
 /// fed by [`Playback::push`]. Dropping this stops playback.
 pub struct Playback {
-    _stream: Stream,
+    // `None` for `Playback::null` (EPIC 12.4) — a background drain task
+    // stands in for the `cpal` output callback instead.
+    _stream: Option<Stream>,
     ring: PlaybackRing,
     sample_rate: u32,
     channels: u16,
@@ -75,11 +83,37 @@ impl Playback {
         stream.play()?;
 
         Ok(Self {
-            _stream: stream,
+            _stream: Some(stream),
             ring,
             sample_rate,
             channels,
         })
+    }
+
+    /// Builds a [`Playback`] with no real audio device behind it (EPIC
+    /// 12.4's canned-audio integration harness, and any other headless
+    /// test): a background task drains the ring every
+    /// [`NULL_DRAIN_INTERVAL`], standing in for the `cpal` output
+    /// callback that would otherwise consume it in real time. `push`,
+    /// `flush`, and `buffered_samples` all behave identically to a real
+    /// [`Playback`] from the caller's point of view — the only observable
+    /// difference is that no sound plays anywhere.
+    pub fn null(sample_rate: u32, channels: u16) -> Self {
+        let ring: PlaybackRing = Arc::new(Mutex::new(VecDeque::new()));
+        let drain_ring = Arc::clone(&ring);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(NULL_DRAIN_INTERVAL).await;
+                drain_ring.lock().expect("playback ring lock poisoned").clear();
+            }
+        });
+
+        Self {
+            _stream: None,
+            ring,
+            sample_rate,
+            channels,
+        }
     }
 
     /// Device output sample rate, in Hz.
@@ -174,5 +208,44 @@ where
             Some(value) => T::from_sample(value),
             None => T::default(),
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn null_playback_accepts_pushes_and_drains_them_in_the_background() {
+        let playback = Playback::null(16_000, 1);
+        assert_eq!(playback.sample_rate(), 16_000);
+        assert_eq!(playback.channels(), 1);
+
+        playback.push(&AudioChunk {
+            seq: 0,
+            pcm: vec![0.1; 400],
+            sample_rate: 16_000,
+            channels: 1,
+        });
+        assert!(playback.buffered_samples() > 0);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while playback.buffered_samples() > 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(playback.buffered_samples(), 0, "null playback must drain on its own");
+    }
+
+    #[tokio::test]
+    async fn null_playback_flush_clears_the_ring_immediately() {
+        let playback = Playback::null(16_000, 1);
+        playback.push(&AudioChunk {
+            seq: 0,
+            pcm: vec![0.1; 400],
+            sample_rate: 16_000,
+            channels: 1,
+        });
+        playback.flush();
+        assert_eq!(playback.buffered_samples(), 0);
     }
 }

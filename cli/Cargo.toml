@@ -18,3 +18,16 @@ async-trait = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
+# Fake STT/TTS gRPC servers + a fake OpenAI-compatible HTTP server for the
+# canned-audio integration test (EPIC 12.4) — same versions core's own
+# equivalent test scaffolding (core/tests/{common,tts_common}, core/tests/
+# llm_integration.rs) already pins.
+protocol = { path = "../protocol" }
+tonic = "0.12"
+tokio = { version = "1", features = ["net"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+hound = "3"

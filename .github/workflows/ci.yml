@@ -1,0 +1,31 @@
+name: CI
+
+# Runs the Rust workspace's test suite headlessly (no mic, no GPU, no
+# Python venvs) on every push/PR — this is what makes EPIC 12.4's
+# canned-audio integration test (cli::converse::canned_audio_tests) and
+# EPIC 12.3's wake→first-audio ≤1.5s assertion inside it actually run in
+# CI, per both stories' "Done when".
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo test --workspace
+        run: cargo test --workspace --locked
+
+      - name: cargo clippy -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings

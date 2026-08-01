@@ -4,6 +4,7 @@
 //! off immediately; downstream stages (wake word, VAD, STT) drain the
 //! returned channel without touching the audio thread.
 
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -13,6 +14,7 @@ use crossbeam_channel::{Receiver, Sender};
 
 use super::device_select::resolve;
 use super::ring::PreRollRing;
+use super::wav_read::{read_wav, WavReadError};
 use super::AudioChunk;
 
 /// Errors that can occur while starting mic capture.
@@ -33,6 +35,9 @@ pub enum CaptureError {
     /// Starting playback of the input stream failed.
     #[error("failed to start input stream: {0}")]
     PlayStream(#[from] cpal::PlayStreamError),
+    /// Reading a wav file failed ([`Capture::from_wav_file`]).
+    #[error(transparent)]
+    Wav(#[from] WavReadError),
 }
 
 /// Live mic capture: owns the `cpal` input stream and hands off
@@ -40,7 +45,10 @@ pub enum CaptureError {
 /// pre-roll ring for same-breath command capture (§2.6).
 pub struct Capture {
     // Keeping the stream alive keeps capture running; dropping it stops it.
-    _stream: Stream,
+    // `None` for `Capture::from_wav_file` (EPIC 12.4): there is no `cpal`
+    // stream to keep alive — every chunk from the file is already queued
+    // on `receiver` by the time that constructor returns.
+    _stream: Option<Stream>,
     receiver: Receiver<AudioChunk>,
     preroll: Arc<Mutex<PreRollRing>>,
     sample_rate: u32,
@@ -84,7 +92,49 @@ impl Capture {
         stream.play()?;
 
         Ok(Self {
-            _stream: stream,
+            _stream: Some(stream),
+            receiver: rx,
+            preroll,
+            sample_rate,
+            channels,
+        })
+    }
+
+    /// Builds a [`Capture`] fed entirely from a wav file rather than a live
+    /// mic (EPIC 12.4's canned-audio integration harness): every sample in
+    /// `path` is chunked into `chunk_samples`-sized [`AudioChunk`]s and
+    /// queued on the same channel/pre-roll ring [`Capture::start`] uses, so
+    /// wake word, VAD, and STT run on the recorded frames exactly as they
+    /// would on live mic input — nothing downstream can tell the
+    /// difference. There is no ongoing "stream" here: every chunk is ready
+    /// the moment this returns, unlike a live mic's callback-driven feed.
+    pub fn from_wav_file(path: &Path, preroll_seconds: f32, chunk_samples: usize) -> Result<Self, CaptureError> {
+        let file = read_wav(path)?;
+        let sample_rate = file.sample_rate;
+        let channels = file.channels;
+
+        let preroll = Arc::new(Mutex::new(PreRollRing::with_duration(
+            preroll_seconds,
+            sample_rate,
+            channels,
+        )));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let seq = Arc::new(AtomicU64::new(0));
+        let ctx = CallbackCtx {
+            tx,
+            preroll: Arc::clone(&preroll),
+            seq,
+            sample_rate,
+            channels,
+        };
+
+        let frame_len = chunk_samples.max(1) * channels.max(1) as usize;
+        for frame in file.pcm.chunks(frame_len) {
+            handle_frames(frame, &ctx);
+        }
+
+        Ok(Self {
+            _stream: None,
             receiver: rx,
             preroll,
             sample_rate,
@@ -191,4 +241,67 @@ fn handle_frames(data: &[f32], ctx: &CallbackCtx) {
         channels: ctx.channels,
     };
     let _ = ctx.tx.send(chunk);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_mono_wav(path: &Path, sample_rate: u32, samples: &[f32]) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).expect("create wav");
+        for &s in samples {
+            writer.write_sample(s).expect("write sample");
+        }
+        writer.finalize().expect("finalize wav");
+    }
+
+    #[test]
+    fn from_wav_file_queues_every_sample_chunked_and_preserves_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("canned.wav");
+        let samples: Vec<f32> = (0..1000).map(|i| (i as f32) / 1000.0).collect();
+        write_mono_wav(&path, 16_000, &samples);
+
+        let capture = Capture::from_wav_file(&path, 1.0, 100).expect("from_wav_file");
+
+        let mut collected = Vec::new();
+        while let Ok(chunk) = capture.chunks().try_recv() {
+            assert_eq!(chunk.sample_rate, 16_000);
+            assert_eq!(chunk.channels, 1);
+            collected.extend(chunk.pcm);
+        }
+        assert_eq!(collected.len(), samples.len());
+        // Float wav round-trips lossily enough that exact equality is the
+        // wrong bar; the values must still match to well within a
+        // single-sample tolerance.
+        for (a, b) in collected.iter().zip(samples.iter()) {
+            assert!((a - b).abs() < 1e-4, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn from_wav_file_populates_the_preroll_ring_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("canned.wav");
+        let samples = vec![0.5f32; 1600];
+        write_mono_wav(&path, 16_000, &samples);
+
+        let capture = Capture::from_wav_file(&path, 1.0, 400).expect("from_wav_file");
+        let preroll = capture.preroll();
+        assert!(!preroll.pcm.is_empty(), "preroll ring should have samples after from_wav_file");
+    }
+
+    #[test]
+    fn from_wav_file_on_a_missing_path_is_a_clear_error_not_a_panic() {
+        match Capture::from_wav_file(Path::new("/nonexistent/path.wav"), 1.0, 100) {
+            Err(CaptureError::Wav(_)) => {}
+            other => panic!("expected CaptureError::Wav, got {}", other.is_ok()),
+        }
+    }
 }

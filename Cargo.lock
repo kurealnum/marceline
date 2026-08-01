@@ -297,12 +297,20 @@ name = "cli"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "core",
  "futures",
+ "hound",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "protocol",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-stream",
  "tokio-util",
+ "tonic",
  "tracing",
 ]
 
