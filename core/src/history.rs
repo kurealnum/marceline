@@ -618,6 +618,30 @@ impl HistoryStore {
         Ok(rows)
     }
 
+    /// Reads the most recent `limit` turns across every session, oldest
+    /// first — `marceline memory list`'s turn-history half (EPIC 11.3),
+    /// which (unlike [`Self::recent_turns`]) is not scoped to one
+    /// conversation: an operator inspecting what's stored wants everything
+    /// recent, not one session picked in advance.
+    pub fn recent_turns_all_sessions(&self, limit: usize) -> Result<Vec<TurnRecord>, HistoryError> {
+        let conn = open_and_prepare(&self.db_path).map_err(|source| HistoryError::Open {
+            path: self.db_path.clone(),
+            source,
+        })?;
+
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, timestamp_ms, role, text, provenance, interrupted
+             FROM turns
+             ORDER BY id DESC
+             LIMIT ?1",
+        )?;
+        let mut rows = stmt
+            .query_map(params![limit as i64], row_to_turn)?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.reverse();
+        Ok(rows)
+    }
+
     /// Reads a single turn by row id, if it exists.
     pub fn get_turn(&self, id: i64) -> Result<Option<TurnRecord>, HistoryError> {
         let conn = open_and_prepare(&self.db_path).map_err(|source| HistoryError::Open {
@@ -881,6 +905,43 @@ mod tests {
         }
 
         let turns = store.recent_turns("s1", 2).unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].text, "turn 3");
+        assert_eq!(turns[1].text, "turn 4");
+    }
+
+    #[test]
+    fn recent_turns_all_sessions_spans_every_session_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HistoryStore::open(dir.path().join("history.db")).unwrap();
+
+        store.log_turn(turn("s1", "user", "first", Trust::User)).unwrap();
+        store
+            .log_turn(turn("s2", "user", "second", Trust::User))
+            .unwrap();
+        store
+            .log_turn(turn("s1", "assistant", "third", Trust::Assistant))
+            .unwrap();
+
+        let turns = store.recent_turns_all_sessions(10).unwrap();
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[0].text, "first");
+        assert_eq!(turns[1].text, "second");
+        assert_eq!(turns[2].text, "third");
+    }
+
+    #[test]
+    fn recent_turns_all_sessions_respects_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HistoryStore::open(dir.path().join("history.db")).unwrap();
+
+        for i in 0..5 {
+            store
+                .log_turn(turn("s1", "user", &format!("turn {i}"), Trust::User))
+                .unwrap();
+        }
+
+        let turns = store.recent_turns_all_sessions(2).unwrap();
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].text, "turn 3");
         assert_eq!(turns[1].text, "turn 4");

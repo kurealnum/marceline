@@ -21,7 +21,16 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use marceline_core::{Config, EmbeddingPipeline, HistoryStore, MemoryRecord, MiniLmEmbedder, Trust};
+use marceline_core::{
+    Config, EmbeddingPipeline, HistoryStore, MemoryRecord, MiniLmEmbedder, Trust, TurnRecord,
+};
+
+/// How many recent turns `memory list` shows by default, overridable with
+/// `--turns <n>`. Long-term memories (the summarizer's distilled facts,
+/// EPIC 10.4) are the more durable half of what's "remembered" and print
+/// in full; raw turn history is comparatively high-volume, so it's capped
+/// unless the operator asks for more.
+const DEFAULT_TURN_LIMIT: usize = 20;
 
 /// Default directory `MiniLmEmbedder::load` reads `model.onnx` +
 /// `tokenizer.json` from, relative to this crate — mirrors `converse.rs`'s
@@ -54,6 +63,18 @@ fn print_memory(m: &MemoryRecord) {
         embed_model = m.embed_model,
         dim = m.dim,
         text = m.text,
+    );
+}
+
+fn print_turn(t: &TurnRecord) {
+    let interrupted = if t.interrupted { " (interrupted)" } else { "" };
+    println!(
+        "#{id}  [{provenance}]  {session_id}/{role}{interrupted}\n    {text}",
+        id = t.id,
+        provenance = provenance_str(t.provenance),
+        session_id = t.session_id,
+        role = t.role,
+        text = t.text,
     );
 }
 
@@ -97,7 +118,12 @@ pub async fn run_memory(args: &[String]) -> ExitCode {
     let model_dir = flag_value(args, "--model-dir").map(PathBuf::from);
 
     match args.get(2).map(String::as_str) {
-        Some("list") => run_list(&config_path).await,
+        Some("list") => {
+            let turn_limit = flag_value(args, "--turns")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(DEFAULT_TURN_LIMIT);
+            run_list(&config_path, turn_limit).await
+        }
         Some("search") => {
             let Some(query) = args.get(3).cloned() else {
                 eprintln!("memory search requires a query");
@@ -137,25 +163,45 @@ pub async fn run_memory(args: &[String]) -> ExitCode {
     }
 }
 
-async fn run_list(config_path: &Path) -> ExitCode {
+/// Runs `marceline memory list` (EPIC 11.3): prints both halves of what's
+/// stored — recent turn history (capped at `turn_limit`, oldest first) and
+/// every long-term memory (the summarizer's distilled facts, EPIC 10.4,
+/// printed in full since it's the durable, comparatively low-volume half).
+async fn run_list(config_path: &Path, turn_limit: usize) -> ExitCode {
     let config_path = config_path.to_path_buf();
-    let result = tokio::task::spawn_blocking(move || -> Result<Vec<MemoryRecord>, String> {
-        let store = open_store(&config_path)?;
-        store
-            .all_memories()
-            .map_err(|err| format!("failed to list memories: {err}"))
-    })
+    let result = tokio::task::spawn_blocking(
+        move || -> Result<(Vec<TurnRecord>, Vec<MemoryRecord>), String> {
+            let store = open_store(&config_path)?;
+            let turns = store
+                .recent_turns_all_sessions(turn_limit)
+                .map_err(|err| format!("failed to list turn history: {err}"))?;
+            let memories = store
+                .all_memories()
+                .map_err(|err| format!("failed to list memories: {err}"))?;
+            Ok((turns, memories))
+        },
+    )
     .await
     .expect("blocking task panicked");
 
     match result {
-        Ok(memories) if memories.is_empty() => {
-            println!("no memories stored yet");
-            ExitCode::SUCCESS
-        }
-        Ok(memories) => {
-            for m in &memories {
-                print_memory(m);
+        Ok((turns, memories)) => {
+            println!("== turn history (most recent {turn_limit}) ==");
+            if turns.is_empty() {
+                println!("no turns logged yet");
+            } else {
+                for t in &turns {
+                    print_turn(t);
+                }
+            }
+
+            println!("== long-term memories ==");
+            if memories.is_empty() {
+                println!("no memories stored yet");
+            } else {
+                for m in &memories {
+                    print_memory(m);
+                }
             }
             ExitCode::SUCCESS
         }

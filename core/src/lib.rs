@@ -4,6 +4,7 @@ pub mod audio;
 pub mod config;
 pub mod config_edit;
 pub mod context;
+pub mod daemon;
 pub mod device;
 pub mod embedding;
 pub mod engine;
@@ -34,6 +35,11 @@ pub use audio::{
 pub use config::{Config, ConfigError};
 pub use config_edit::ConfigEditError;
 pub use context::recent_context;
+pub use daemon::{
+    control_socket_path, pidfile_path, read_pidfile, remove_pidfile, runtime_dir, send_request,
+    write_pidfile, ControlError, ControlRequest, ControlResponse, StageHealth, StatusReport,
+    WireConversationState,
+};
 pub use device::Device;
 pub use embedding::{EmbedError, EmbeddingPipeline, MiniLmEmbedder, MINILM_DIM};
 pub use engine::{AudioStream, EngineError};

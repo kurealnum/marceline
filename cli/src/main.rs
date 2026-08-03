@@ -10,6 +10,8 @@ use marceline_core::{Device, HealthView, Supervisor, WorkerSpec};
 use tokio::sync::{watch, RwLock};
 
 mod converse;
+mod lifecycle;
+mod logs;
 mod memory;
 mod say;
 mod say_to_llm;
@@ -22,8 +24,13 @@ const DEFAULT_CONFIG: &str = "config.toml";
 /// Config keys `marceline config set` accepts today.
 ///
 /// An allowlist rather than "anything the file contains": a typo silently
-/// adding a key the daemon ignores is worse than being told no.
-const SETTABLE_KEYS: &[&str] = &["stt.model", "stt.backend"];
+/// adding a key the daemon ignores is worse than being told no. This
+/// doubles as the secret-inlining guard SPEC.md §3.1 requires (e.g.
+/// `llm.api_key`) — a key never earns a spot here just because it parses
+/// as `table.field`, and every credential in config.toml is named
+/// `*_env` (an environment variable name, not the secret itself), so none
+/// of those keys have any business being settable through this path.
+const SETTABLE_KEYS: &[&str] = &["stt.model", "stt.backend", "tts.backend", "tts.voice"];
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
@@ -43,8 +50,16 @@ fn main() -> ExitCode {
         Some("say") => runtime.block_on(run_say(&args)),
         Some("say-to-llm") => runtime.block_on(run_say_to_llm(&args)),
         Some("converse") => runtime.block_on(run_converse(&args)),
-        Some("config") => run_config(&args),
+        Some("config") => runtime.block_on(run_config(&args)),
         Some("memory") => runtime.block_on(memory::run_memory(&args)),
+        Some(cmd @ ("start" | "stop" | "status")) => {
+            runtime.block_on(lifecycle::run_lifecycle(cmd, &args))
+        }
+        Some("logs") => runtime.block_on(logs::run_logs(&args)),
+        // Hidden: the actual daemon body `start` spawns detached via
+        // `setsid`. Not part of the documented command surface — an
+        // operator drives the daemon through `start`/`stop`/`status`.
+        Some("__daemon-run") => runtime.block_on(lifecycle::run_daemon_process(&args)),
         Some("--help") | Some("-h") => {
             print_usage();
             ExitCode::SUCCESS
@@ -68,17 +83,21 @@ fn print_usage() {
     eprintln!(
         "\
 Usage:
-  marceline                            Run the daemon
+  marceline                            Run the epic-0 stub worker (see `start` for the real daemon)
+  marceline start                      Start the daemon in the background
+  marceline stop                       Gracefully stop the running daemon
+  marceline status                     Show per-stage health and state of a running daemon
   marceline transcribe <file.wav>      Transcribe a wav file and print the text
   marceline say <text>                 Speak text aloud, per [tts] config
   marceline say-to-llm <text>          Stream an LLM reply to text, per [llm] config
   marceline converse                   Run the full wake->listen->think->speak MVP loop
   marceline config get <key>           Print a config value
   marceline config set <key> <value>   Change a config value
-  marceline memory list                List stored long-term memories
+  marceline memory list                List recent turn history and long-term memories
   marceline memory search <query>      Find memories similar to a query
   marceline memory edit <id> <text>    Replace a memory's text and re-embed it
   marceline memory forget <id>         Delete a memory by row id
+  marceline logs [--follow]            Print (or stream) the daemon's log file
   marceline --version                  Print the version
 
 Settable keys: {keys}
@@ -91,6 +110,7 @@ Options:
                       launching one from config (e.g. /tmp/marceline-stt.sock)
   --model-dir <path>  Embedding model directory for memory edit/search
   --k <n>             Result count for memory search (default 5)
+  --turns <n>         Turn history rows for memory list (default 20)
   --verbose           Debug-level logging",
         keys = SETTABLE_KEYS.join(", "),
         soul_default = say_to_llm::DEFAULT_SOUL,
@@ -219,14 +239,21 @@ async fn run_converse(args: &[String]) -> ExitCode {
     }
 }
 
-/// Runs `marceline config get|set` (EPIC 3.4; full config CLI is 11.2).
+/// Runs `marceline config get|set` (EPIC 3.4, widened to the full config
+/// CLI + model-swap shortcuts by EPIC 11.2).
 ///
-/// The `set` path is the CLI trigger for a model swap: it changes
-/// `[stt].model` in the file, and the next worker launch picks it up. A
-/// running daemon does not yet see the edit — that needs a control channel
-/// into the daemon, which is EPIC 11.2's job; this is called out in the
-/// output rather than left to surprise someone.
-fn run_config(args: &[String]) -> ExitCode {
+/// The `set` path always changes `config.toml` first (so the value
+/// survives a restart), then — for `stt.*` keys, and only when a daemon is
+/// actually reachable (see [`daemon::runtime_dir`]) — asks it to swap the
+/// STT worker live over the control socket, so "swap Whisper for
+/// faster-whisper" is a one-line operation with no full daemon restart.
+/// `tts.*` keys cannot do this yet: `core::tts::manager` deliberately has
+/// no hot-swap path (see its module doc — nothing in EPIC 5 needed a
+/// running worker's voice changed without a restart), so those just print
+/// the same "takes effect on next launch" note `stt.*` always printed
+/// before this story, and a daemon-unreachable `stt.*` set falls back to
+/// it too.
+async fn run_config(args: &[String]) -> ExitCode {
     let config_path =
         PathBuf::from(flag_value(args, "--config").unwrap_or_else(|| DEFAULT_CONFIG.to_string()));
 
@@ -269,10 +296,13 @@ fn run_config(args: &[String]) -> ExitCode {
                 Ok(previous) => {
                     let previous = previous.unwrap_or_else(|| "(unset)".to_string());
                     println!("{key}: {previous} -> {value}");
-                    if key.starts_with("stt.") {
+                    if key == "stt.model" || key == "stt.backend" {
+                        swap_stt_live_if_running(&config_path, key, value).await;
+                    } else if key.starts_with("tts.") {
                         eprintln!(
-                            "the stt worker will load this on its next launch; \
-                             a running daemon keeps its current model until restarted"
+                            "the tts worker will load this on its next launch; \
+                             a running daemon keeps its current voice/backend until restarted \
+                             (no live swap for tts, unlike stt)"
                         );
                     }
                     ExitCode::SUCCESS
@@ -289,6 +319,61 @@ fn run_config(args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Asks a running daemon (if one is reachable) to swap its STT worker live
+/// onto the value `marceline config set` just wrote, rather than waiting
+/// for the operator to restart it themselves. Prints the fallback "takes
+/// effect on next launch" note instead when no daemon answers — the same
+/// message this path always printed before live swap existed.
+async fn swap_stt_live_if_running(config_path: &Path, changed_key: &str, new_value: &str) {
+    let config = match marceline_core::Config::load(config_path) {
+        Ok(config) => config,
+        // The write above already succeeded against this same file, so a
+        // load failure here would be surprising; either way, there is no
+        // daemon to notify without it, so just fall back to the note.
+        Err(_) => {
+            print_no_live_swap_note();
+            return;
+        }
+    };
+    let dir = marceline_core::daemon::runtime_dir(&config.memory.expanded_db_path());
+    let control_socket = marceline_core::daemon::control_socket_path(&dir);
+
+    let request = match changed_key {
+        "stt.model" => marceline_core::ControlRequest::SwapSttModel {
+            model: new_value.to_string(),
+            backend: None,
+        },
+        // "stt.backend": the model id itself is unchanged; the freshly
+        // loaded worker's own reported `SttInfo` is what actually applies.
+        _ => marceline_core::ControlRequest::SwapSttModel {
+            model: config.stt.model.clone(),
+            backend: Some(new_value.to_string()),
+        },
+    };
+
+    match marceline_core::send_request(&control_socket, &request).await {
+        Ok(marceline_core::ControlResponse::Swapped { model }) => {
+            println!("daemon swapped its stt worker live; now running {model}");
+        }
+        Ok(marceline_core::ControlResponse::SwapFailed { reason }) => {
+            eprintln!("daemon rejected the live stt swap: {reason}");
+        }
+        Ok(other) => {
+            eprintln!("daemon sent an unexpected reply to the swap request: {other:?}");
+        }
+        // No daemon reachable (or it didn't answer) — not an error, just
+        // the same "next launch" state this path has always been in.
+        Err(_) => print_no_live_swap_note(),
+    }
+}
+
+fn print_no_live_swap_note() {
+    eprintln!(
+        "the stt worker will load this on its next launch; \
+         no running daemon answered, so nothing was swapped live"
+    );
 }
 
 /// Reads the value following `flag` in `args`, if present.
