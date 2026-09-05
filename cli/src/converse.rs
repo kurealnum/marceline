@@ -42,10 +42,12 @@ use marceline_core::stt::SttWorkerPaths;
 use marceline_core::transcribe::{TranscribeOutcome, DEFAULT_TIMEOUT};
 use marceline_core::tts::TtsWorkerPaths;
 use marceline_core::{
-    compile_system_prompt, sentence_chunk, ChatRequest, Config, ConversationEvent,
-    ConversationState, EnergyWakeDetector, FailedStage, Gate, GateOutput, GrpcTtsEngine,
-    HealthView, LlmEngine, Message, OpenAiCompatibleEngine, Orchestrator, Playback, Role,
-    SileroVad, SttManager, Stages, TtsEngine, VadEndpointer, VoiceId, DEFAULT_SPEECH_THRESHOLD,
+    compile_system_prompt, register_mcp_tools, resolve_max_iterations, sentence_chunk, think,
+    ChatEvent, ChatEventStream, Config, ConversationEvent, ConversationState, DeclineAll,
+    EnergyWakeDetector, FailedStage, Gate, GateOutput, GetTimeTool, GrpcTtsEngine, HealthView,
+    LlmEngine, ListDirTool, OpenAiCompatibleEngine, Orchestrator, Playback, ReadFileTool,
+    SileroVad, SttManager, Stages, ToolBroker, TtsEngine, TurnBuffer, VadEndpointer, VoiceId,
+    WebSearchTool, DEFAULT_SPEECH_THRESHOLD,
 };
 use marceline_core::audio::Capture;
 use tokio::sync::{watch, RwLock};
@@ -210,6 +212,29 @@ pub async fn converse_ex(
         soul_watch_cancel.clone(),
     );
 
+    // Built once at daemon start, exactly as `say_to_llm` does (EPIC 6/6.4):
+    // v1's read-only built-ins plus whatever MCP servers are configured.
+    // Shared (`Arc`) across every turn's `think` call below rather than
+    // rebuilt per turn — an MCP server's connection is not cheap to reopen,
+    // and there is no reason to.
+    let mut broker = ToolBroker::new();
+    broker
+        .register(Arc::new(GetTimeTool))
+        .expect("get_time is the first registration");
+    broker
+        .register(Arc::new(ReadFileTool))
+        .expect("read_file is the first registration");
+    broker
+        .register(Arc::new(ListDirTool))
+        .expect("list_dir is the first registration");
+    broker
+        .register(Arc::new(WebSearchTool::new()?))
+        .expect("web_search is the first registration");
+    for skipped in register_mcp_tools(&mut broker, &config.mcp).await {
+        tracing::warn!(server = %skipped, "mcp server unavailable, continuing without it");
+    }
+    let broker = Arc::new(broker);
+
     let capture = Capture::start(1.5, config.audio.input_device.as_deref())?;
     let detector = EnergyWakeDetector::new(config.wake.sensitivity, 16_000, 1600);
     let wake = marceline_core::WakeEngine::new(&config.wake, Box::new(detector));
@@ -324,6 +349,7 @@ pub async fn converse_ex(
             &soul_watcher,
             &current_run,
             &state_tx,
+            &broker,
         ) => res,
         _ = sigterm.recv() => {
             tracing::info!("SIGTERM received; running graceful shutdown ordering (SPEC.md §2.5.1)");
@@ -377,6 +403,7 @@ async fn run_loop(
     soul_watcher: &marceline_core::soul_watch::SoulWatcher,
     current_run: &CurrentRun,
     state_tx: &watch::Sender<ConversationState>,
+    broker: &Arc<ToolBroker>,
 ) -> Result<(), ConverseError> {
     let transcribe_timeout = Duration::from_millis(config.orchestrator.transcribe_timeout_ms);
     let think_timeout = Duration::from_millis(config.orchestrator.think_timeout_ms);
@@ -537,17 +564,51 @@ async fn run_loop(
         // SOUL.md save takes effect on the very next turn (EPIC 9.2).
         let persona = soul_watcher.current();
         let system_prompt = compile_system_prompt(&persona.render(), &[]);
-        let messages = vec![
-            Message::new(Role::System, &system_prompt),
-            Message::new(Role::User, transcript),
-        ];
-        let events = llm
-            .chat(ChatRequest {
+        let context_window = llm.info().context_window;
+        let mut turns = TurnBuffer::new();
+        turns.push_user(transcript);
+        let messages = turns.messages_for_request(&system_prompt, context_window);
+        let policy = persona.tool_policy();
+        let tools = broker.catalog();
+        let max_iterations = resolve_max_iterations(config.llm.max_tool_iterations_per_turn);
+        let max_tokens = config.llm.max_tokens_per_turn;
+
+        // `think` (EPIC 6.3) drives the whole tool-call loop itself instead
+        // of just returning a `ChatEventStream`, so it runs on its own
+        // task; its `on_text` callback feeds an mpsc channel wrapped as a
+        // `ChatEventStream` — the same seam [`sentence_chunk`] already
+        // consumes — so speech still starts on the first sentence rather
+        // than waiting for the whole tool loop (and every tool call in it)
+        // to finish. The channel's sender lives only inside `think`'s own
+        // closure, so it drops (ending the stream, flushing any trailing
+        // partial sentence) the instant `think` returns.
+        let (text_tx, mut text_rx) =
+            tokio::sync::mpsc::unbounded_channel::<Result<ChatEvent, marceline_core::EngineError>>();
+        let think_broker = Arc::clone(broker);
+        let think_cancel = run_token.clone();
+        let think_task = tokio::spawn(async move {
+            think(
+                &llm,
+                &think_broker,
                 messages,
-                tools: Vec::new(),
-                max_tokens: config.llm.max_tokens_per_turn,
-            })
-            .await;
+                tools,
+                &policy,
+                max_tokens,
+                max_iterations,
+                think_cancel,
+                // No real voice-confirmation path exists yet (EPIC 6.5/9.3
+                // built the seam, nothing speaks a prompt yet); every real
+                // tool today is `ReadOnly` (§10) so this is never actually
+                // consulted — fail closed if that ever changes.
+                &DeclineAll,
+                move |delta: &str| {
+                    let _ = text_tx.send(Ok(ChatEvent::TextDelta(delta.to_string())));
+                },
+            )
+            .await
+        });
+        let events: ChatEventStream =
+            Box::pin(futures::stream::poll_fn(move |cx| text_rx.poll_recv(cx)));
         let mut sentences = sentence_chunk(events);
 
         // First sentence pulled eagerly, under `think_timeout`: this is
@@ -686,6 +747,20 @@ async fn run_loop(
             .await
             .ok();
         state_tx.send_replace(orchestrator.state());
+
+        // The tool loop finished speaking its text well before this point
+        // (it only needs to have produced *some* text, not have returned),
+        // so this join is normally instant — it exists to surface an
+        // iteration-cap warning or a `think` failure that never showed up
+        // as a `ChatEvent` (e.g. a cancellation between tool-call rounds).
+        match think_task.await {
+            Ok(Ok((outcome, _messages))) if outcome.iteration_cap_hit => {
+                tracing::warn!(max_iterations, "tool iteration cap hit; forced a final answer");
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => tracing::error!(%err, "thinking loop failed"),
+            Err(err) => tracing::error!(%err, "think task panicked"),
+        }
     }
 }
 
