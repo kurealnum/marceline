@@ -48,6 +48,7 @@ pub use history::{HistoryError, HistoryStore, MemoryRecord, NewMemory, NewTurn, 
 pub use llm::{
     compile_system_prompt, ChatEvent, ChatEventStream, ChatRequest, DropOldestTurn, FinishReason,
     LlmEngine, LlmInfo, MemoryEntry, Message, OpenAiCompatibleEngine, Role, SessionGuard,
+    SessionGuardState,
     ToolCallRequest, ToolSpec, TrimPolicy, Trust, TurnBuffer,
 };
 pub use mcp::{register_mcp_tools, McpCallOutcome, McpClient, McpError, McpTool, McpToolInfo};
