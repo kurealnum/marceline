@@ -199,6 +199,33 @@ mod tests {
     }
 
     #[test]
+    fn a_second_turns_request_carries_the_first_turns_messages() {
+        // Mirrors how `cli::converse::run_loop` drives a `TurnBuffer` turn
+        // by turn (EPIC 10): push the user text, build the request, then
+        // push the assistant's reply once it's known — the second turn's
+        // request must still see the first turn's exchange.
+        let mut buffer = TurnBuffer::new();
+
+        buffer.push_user("my name is Oscar");
+        let first_request = buffer.messages_for_request("You are Marceline.", 10_000);
+        assert_eq!(first_request.len(), 2, "system prompt + the first user turn");
+        buffer.push_assistant("Nice to meet you, Oscar!");
+
+        buffer.push_user("what is my name?");
+        let second_request = buffer.messages_for_request("You are Marceline.", 10_000);
+
+        assert_eq!(
+            second_request.len(),
+            4,
+            "system prompt + first user/assistant turn + the new user turn"
+        );
+        assert_eq!(second_request[0].role, Role::System);
+        assert_eq!(second_request[1].content, "my name is Oscar");
+        assert_eq!(second_request[2].content, "Nice to meet you, Oscar!");
+        assert_eq!(second_request[3].content, "what is my name?");
+    }
+
+    #[test]
     fn a_zero_context_window_skips_trimming() {
         let mut buffer = TurnBuffer::new();
         buffer.turns.push(long_turn(Role::User, 10_000));
