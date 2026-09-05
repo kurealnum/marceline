@@ -82,6 +82,20 @@ pub enum ConverseError {
 /// just make sure the user hears *something* rather than silence.
 const GRACEFUL_ERROR_MESSAGE: &str = "Sorry, I ran into a problem with that. Please try again.";
 
+/// The `StageError` `reason` used when [`SessionGuard`] refuses a request
+/// (`EngineError::GuardrailRefused`, SPEC.md §4.5) — an exact-match marker
+/// rather than the error's own `to_string()`, so [`ErrorSpeaker`] can tell
+/// this apart from a genuine fault and speak [`SESSION_LIMIT_MESSAGE`]
+/// instead of [`GRACEFUL_ERROR_MESSAGE`].
+const SESSION_LIMIT_REASON: &str = "session request limit reached";
+
+/// Spoken in place of [`GRACEFUL_ERROR_MESSAGE`] when the LLM stage failed
+/// specifically because [`SessionGuard`] hit `max_requests_per_session` —
+/// a budget cap, not a fault, so it says so rather than the generic
+/// "I ran into a problem" (SPEC.md §4.5, EPIC 4.5).
+const SESSION_LIMIT_MESSAGE: &str =
+    "I've reached my request limit for this session. Please try again in a bit.";
+
 /// A [`Stages`] impl whose only real work is the `ERROR` edge (SPEC.md
 /// §2.5, EPIC 8.3): every other hook is a no-op because the happy-path
 /// stage work runs in [`converse`]'s driving loop instead (see module
@@ -124,9 +138,13 @@ impl<'a> Stages for ErrorSpeaker<'a> {
                 return;
             }
         };
-        let text_stream: marceline_core::TextStream = Box::pin(futures::stream::once(async {
-            Ok(GRACEFUL_ERROR_MESSAGE.to_string())
-        }));
+        let message = if reason == SESSION_LIMIT_REASON {
+            SESSION_LIMIT_MESSAGE
+        } else {
+            GRACEFUL_ERROR_MESSAGE
+        };
+        let text_stream: marceline_core::TextStream =
+            Box::pin(futures::stream::once(async move { Ok(message.to_string()) }));
         let mut audio = tts.synthesize(text_stream, self.voice.clone()).await;
         while let Some(chunk) = audio.next().await {
             match chunk {
@@ -154,6 +172,11 @@ const WAKE_POLL_TIMEOUT: Duration = Duration::from_millis(200);
 /// (EPIC 9.2). Fast enough that a save feels live, cheap enough to poll
 /// forever in the background.
 const SOUL_WATCH_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How long `[llm].max_requests_per_session` counts against before the
+/// count rolls over on its own (SPEC.md §4.5) — see
+/// `converse_ex`'s `session_guard_state`.
+const SESSION_GUARD_WINDOW: Duration = Duration::from_secs(60 * 60);
 
 /// Runs the MVP loop forever: wake, listen, transcribe, think, speak,
 /// back to idle. Returns only on an unrecoverable setup failure (a worker
@@ -209,6 +232,18 @@ pub async fn converse_ex(
         SOUL_WATCH_POLL_INTERVAL,
         soul_watch_cancel.clone(),
     );
+
+    // Shared across every turn's `SessionGuard` (SPEC.md §4.5) so
+    // `max_requests_per_session` is enforced across the daemon's whole
+    // run rather than resetting to zero every turn (a fresh engine, and so
+    // a fresh guard, is built each turn to carry that turn's own
+    // cancellation token — see `run_loop`'s `SessionGuard::with_state`
+    // call). A rolling window, not a permanent counter: once
+    // `SESSION_GUARD_WINDOW` has elapsed since the cap was last hit, the
+    // count resets on its own, so the daemon recovers without a restart.
+    let session_guard_state = Arc::new(marceline_core::SessionGuardState::with_rolling_window(
+        Some(SESSION_GUARD_WINDOW),
+    ));
 
     let capture = Capture::start(1.5, config.audio.input_device.as_deref())?;
     let detector = EnergyWakeDetector::new(config.wake.sensitivity, 16_000, 1600);
@@ -324,6 +359,7 @@ pub async fn converse_ex(
             &soul_watcher,
             &current_run,
             &state_tx,
+            &session_guard_state,
         ) => res,
         _ = sigterm.recv() => {
             tracing::info!("SIGTERM received; running graceful shutdown ordering (SPEC.md §2.5.1)");
@@ -377,6 +413,7 @@ async fn run_loop(
     soul_watcher: &marceline_core::soul_watch::SoulWatcher,
     current_run: &CurrentRun,
     state_tx: &watch::Sender<ConversationState>,
+    session_guard_state: &Arc<marceline_core::SessionGuardState>,
 ) -> Result<(), ConverseError> {
     let transcribe_timeout = Duration::from_millis(config.orchestrator.transcribe_timeout_ms);
     let think_timeout = Duration::from_millis(config.orchestrator.think_timeout_ms);
@@ -447,8 +484,18 @@ async fn run_loop(
         };
         // Cheap to build per turn: no persistent connection, just an HTTP
         // client config, so it carries this turn's own token rather than
-        // one fixed for the process lifetime.
-        let llm = OpenAiCompatibleEngine::new(&config.llm, run_token.clone())?;
+        // one fixed for the process lifetime. Wrapped in `SessionGuard`
+        // (§4.5) every turn too — a fresh guard each time, since the guard
+        // itself is generic over the (per-turn) engine it wraps, but
+        // sharing `session_guard_state` is what makes
+        // `max_requests_per_session` actually count across turns instead
+        // of resetting to zero along with the engine.
+        let llm = marceline_core::SessionGuard::with_state(
+            OpenAiCompatibleEngine::new(&config.llm, run_token.clone())?,
+            config.llm.max_tokens_per_turn,
+            config.llm.max_requests_per_session,
+            Arc::clone(session_guard_state),
+        );
 
         // LISTENING: collect the utterance. The gate's own no-speech
         // timeout (`[vad].no_speech_timeout_ms`, EPIC 8.3) covers the
@@ -557,10 +604,19 @@ async fn run_loop(
         let first_sentence = match tokio::time::timeout(think_timeout, sentences.next()).await {
             Ok(Some(Ok(text))) => text,
             Ok(Some(Err(err))) => {
+                // A `SessionGuard` refusal (§4.5) is a budget cap, not a
+                // fault — spoken as such rather than the generic error
+                // message, via the exact-match reason `ErrorSpeaker` looks
+                // for.
+                let reason = if err.is_guardrail_refused() {
+                    SESSION_LIMIT_REASON.to_string()
+                } else {
+                    err.to_string()
+                };
                 let _ = orchestrator
                     .apply(ConversationEvent::StageError {
                         stage: FailedStage::Llm,
-                        reason: err.to_string(),
+                        reason,
                     })
                     .await;
                 let _ = orchestrator.apply(ConversationEvent::ErrorHandled).await;

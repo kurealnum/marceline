@@ -24,7 +24,7 @@ use futures::Stream;
 
 use crate::engine::EngineError;
 
-pub use guard::SessionGuard;
+pub use guard::{SessionGuard, SessionGuardState};
 pub use openai::OpenAiCompatibleEngine;
 pub use prompt::{compile_system_prompt, MemoryEntry, Trust};
 pub use turns::{DropOldestTurn, TrimPolicy, TurnBuffer};
