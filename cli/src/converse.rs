@@ -42,13 +42,17 @@ use marceline_core::stt::SttWorkerPaths;
 use marceline_core::transcribe::{TranscribeOutcome, DEFAULT_TIMEOUT};
 use marceline_core::tts::TtsWorkerPaths;
 use marceline_core::{
-    compile_system_prompt, sentence_chunk, ChatRequest, Config, ConversationEvent,
-    ConversationState, EnergyWakeDetector, FailedStage, Gate, GateOutput, GrpcTtsEngine,
-    HealthView, LlmEngine, Message, OpenAiCompatibleEngine, Orchestrator, Playback, Role,
-    SileroVad, SttManager, Stages, TtsEngine, VadEndpointer, VoiceId, DEFAULT_SPEECH_THRESHOLD,
+    compile_prompt_with_retrieval, compile_system_prompt, ensure_current_embed_model,
+    recent_context, register_mcp_tools, resolve_max_iterations, sentence_chunk, think, ChatEvent,
+    ChatEventStream, Config, ConversationEvent, ConversationState, DeclineAll, EmbedError,
+    EnergyWakeDetector, FailedStage, Gate, GateOutput, GetTimeTool, GrpcTtsEngine, HealthView,
+    HistoryError, HistoryStore, LlmEngine, LlmSummarizer, ListDirTool, MemoryError, MiniLmEmbedder,
+    NewTurn, OpenAiCompatibleEngine, Orchestrator, Playback, ReadFileTool, SileroVad, SttManager,
+    Stages, Summarizer, ToolBroker, TtsEngine, TurnBuffer, Trust, VadEndpointer, VoiceId,
+    WebSearchTool, DEFAULT_SPEECH_THRESHOLD,
 };
 use marceline_core::audio::Capture;
-use tokio::sync::{watch, RwLock};
+use tokio::sync::{watch, Mutex as AsyncMutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 /// The one run token currently in flight, shared with the `ctrl-c`
@@ -75,6 +79,15 @@ pub enum ConverseError {
     /// The wake/VAD gate could not load its VAD model.
     #[error(transparent)]
     Vad(#[from] marceline_core::VadError),
+    /// Opening the history store failed.
+    #[error(transparent)]
+    History(#[from] HistoryError),
+    /// Loading the embedding model failed.
+    #[error(transparent)]
+    Embed(#[from] EmbedError),
+    /// Checking/re-embedding the long-term memory index at startup failed.
+    #[error(transparent)]
+    Memory(#[from] MemoryError),
 }
 
 /// A short, fixed message spoken on any non-TTS stage failure (SPEC.md
@@ -178,6 +191,57 @@ const SOUL_WATCH_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// `converse_ex`'s `session_guard_state`.
 const SESSION_GUARD_WINDOW: Duration = Duration::from_secs(60 * 60);
 
+/// The one session every `converse` turn belongs to (EPIC 10.2/10.4). v1 has
+/// no notion of multiple concurrent conversations — a single fixed id (not
+/// one minted fresh per process start) is what lets a restarted daemon find
+/// its own prior turns again via [`recent_context`].
+const DEFAULT_SESSION_ID: &str = "default";
+
+/// How many of the most recent persisted turns seed a fresh [`TurnBuffer`]
+/// on daemon startup (EPIC 10.2).
+const RECENT_CONTEXT_TURN_LIMIT: usize = 50;
+
+/// How many long-term memories [`compile_prompt_with_retrieval`] pulls in
+/// per turn (EPIC 10.5).
+const MEMORY_RETRIEVAL_K: usize = 5;
+
+/// How many recent turns the background summarizer distills per run
+/// (EPIC 10.4).
+const SUMMARY_TURN_LIMIT: usize = 20;
+
+/// Token cap on the summarizer's own distillation response — a short
+/// standing fact, not a full transcript.
+const SUMMARIZER_MAX_TOKENS: u32 = 200;
+
+/// Default directory `MiniLmEmbedder::load` reads `model.onnx` +
+/// `tokenizer.json` from, relative to this crate — mirrors `memory.rs`'s
+/// identical helper and `converse.rs`'s own `models/silero_vad.onnx`
+/// convention.
+fn default_embed_model_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/all-MiniLM-L6-v2")
+}
+
+/// Current Unix epoch milliseconds, for [`NewTurn::timestamp_ms`].
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is before the unix epoch")
+        .as_millis() as i64
+}
+
+/// Persists `turn` through [`HistoryStore`]'s write actor from a
+/// [`tokio::task::spawn_blocking`] task, per `log_turn`'s own doc comment —
+/// logs and swallows a failure rather than propagating one, since a history
+/// write failing should never take down the live conversation turn.
+async fn log_turn_async(store: &HistoryStore, turn: NewTurn) {
+    let store = store.clone();
+    match tokio::task::spawn_blocking(move || store.log_turn(turn)).await {
+        Ok(Ok(_id)) => {}
+        Ok(Err(err)) => tracing::error!(%err, "failed to log turn to history"),
+        Err(err) => tracing::error!(%err, "log_turn task panicked"),
+    }
+}
+
 /// Runs the MVP loop forever: wake, listen, transcribe, think, speak,
 /// back to idle. Returns only on an unrecoverable setup failure (a worker
 /// or device that never came up) — a mid-turn stage failure routes
@@ -208,10 +272,9 @@ const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 ///   the run cancel token; (2) each side-effecting tool's own kill logic
 ///   already rides that same cancellation (EPIC 6's tool broker propagates
 ///   it, nothing further to do here); (3) flush + stop audio out; (4)
-///   checkpoint memory/history — a no-op today, since this MVP loop does
-///   not yet wire history/memory in (EPIC 10's daemon-startup wiring is
-///   still an open follow-up) and every write that *does* happen elsewhere
-///   already commits synchronously through `HistoryStore`'s write actor;
+///   checkpoint memory/history — a no-op, since every turn's write already
+///   commits synchronously through `HistoryStore`'s write actor as it
+///   happens (EPIC 10.1/10.2);
 ///   (5) signal the STT/TTS workers to exit; (6) wait (bounded by
 ///   [`SHUTDOWN_DRAIN_TIMEOUT`]) for that to land, then return so the
 ///   process can exit — a still-running child is hard-killed by the
@@ -244,6 +307,65 @@ pub async fn converse_ex(
     let session_guard_state = Arc::new(marceline_core::SessionGuardState::with_rolling_window(
         Some(SESSION_GUARD_WINDOW),
     ));
+
+    // Built once at daemon start, exactly as `say_to_llm` does (EPIC 6/6.4):
+    // v1's read-only built-ins plus whatever MCP servers are configured.
+    // Shared (`Arc`) across every turn's `think` call below rather than
+    // rebuilt per turn — an MCP server's connection is not cheap to reopen,
+    // and there is no reason to.
+    let mut broker = ToolBroker::new();
+    broker
+        .register(Arc::new(GetTimeTool))
+        .expect("get_time is the first registration");
+    broker
+        .register(Arc::new(ReadFileTool))
+        .expect("read_file is the first registration");
+    broker
+        .register(Arc::new(ListDirTool))
+        .expect("list_dir is the first registration");
+    broker
+        .register(Arc::new(WebSearchTool::new()?))
+        .expect("web_search is the first registration");
+    for skipped in register_mcp_tools(&mut broker, &config.mcp).await {
+        tracing::warn!(server = %skipped, "mcp server unavailable, continuing without it");
+    }
+    let broker = Arc::new(broker);
+
+    // History/memory (EPIC 10): opened once here and threaded through
+    // `run_loop`, so the conversation loop actually persists what it hears
+    // and says instead of forgetting it on the next turn or a restart.
+    let history_store = {
+        let db_path = config.memory.expanded_db_path();
+        tokio::task::spawn_blocking(move || HistoryStore::open(db_path))
+            .await
+            .expect("history store open task panicked")?
+    };
+    let mut turn_buffer = {
+        let store = history_store.clone();
+        tokio::task::spawn_blocking(move || {
+            recent_context(&store, DEFAULT_SESSION_ID, RECENT_CONTEXT_TURN_LIMIT)
+        })
+        .await
+        .expect("recent_context task panicked")
+        .map(TurnBuffer::from_turns)?
+    };
+    // Only built when `[memory].longterm` is on (EPIC 10.5) — a missing
+    // model directory then fails startup with a clear error rather than
+    // silently running without long-term memory.
+    let embed_pipeline: Option<Arc<AsyncMutex<MiniLmEmbedder>>> = if config.memory.longterm {
+        let model_dir = default_embed_model_dir();
+        let mut pipeline = MiniLmEmbedder::load(&model_dir, config.memory.embed_model.clone())?;
+        let store_for_check = history_store.clone();
+        tokio::task::spawn_blocking(move || -> Result<MiniLmEmbedder, MemoryError> {
+            ensure_current_embed_model(&store_for_check, &mut pipeline)?;
+            Ok(pipeline)
+        })
+        .await
+        .expect("ensure_current_embed_model task panicked")
+        .map(|pipeline| Some(Arc::new(AsyncMutex::new(pipeline))))?
+    } else {
+        None
+    };
 
     let capture = Capture::start(1.5, config.audio.input_device.as_deref())?;
     let detector = EnergyWakeDetector::new(config.wake.sensitivity, 16_000, 1600);
@@ -360,6 +482,10 @@ pub async fn converse_ex(
             &current_run,
             &state_tx,
             &session_guard_state,
+            &broker,
+            &history_store,
+            embed_pipeline.as_ref(),
+            &mut turn_buffer,
         ) => res,
         _ = sigterm.recv() => {
             tracing::info!("SIGTERM received; running graceful shutdown ordering (SPEC.md §2.5.1)");
@@ -379,10 +505,10 @@ pub async fn converse_ex(
         }
     };
 
-    // (4) checkpoint memory/history to SQLite: a no-op today (see
-    // `converse_ex`'s doc comment — this loop does not yet wire history
-    // in, and every write that does happen elsewhere already commits
-    // synchronously through `HistoryStore`'s write actor, EPIC 10.1).
+    // (4) checkpoint memory/history to SQLite: a no-op here — every turn's
+    // history write already commits synchronously through `HistoryStore`'s
+    // write actor as it happens (EPIC 10.1/10.2), so there is nothing left
+    // to flush at shutdown.
     // (5) signal the STT/TTS workers to exit.
     let _ = stt_shutdown_tx.send(true);
     let _ = tts_shutdown_tx.send(true);
@@ -414,6 +540,10 @@ async fn run_loop(
     current_run: &CurrentRun,
     state_tx: &watch::Sender<ConversationState>,
     session_guard_state: &Arc<marceline_core::SessionGuardState>,
+    broker: &Arc<ToolBroker>,
+    history_store: &HistoryStore,
+    embed_pipeline: Option<&Arc<AsyncMutex<MiniLmEmbedder>>>,
+    turn_buffer: &mut TurnBuffer,
 ) -> Result<(), ConverseError> {
     let transcribe_timeout = Duration::from_millis(config.orchestrator.transcribe_timeout_ms);
     let think_timeout = Duration::from_millis(config.orchestrator.think_timeout_ms);
@@ -581,20 +711,91 @@ async fn run_loop(
 
         // THINKING: only `Final` transcripts ever reach here (§2.4.1).
         // Recompiled from the watcher's latest persona every turn, so a
-        // SOUL.md save takes effect on the very next turn (EPIC 9.2).
+        // SOUL.md save takes effect on the very next turn (EPIC 9.2). When
+        // `[memory].longterm` is on, long-term memory is retrieved and
+        // folded in too (EPIC 10.5); a retrieval failure falls back to the
+        // plain persona prompt rather than failing the whole turn.
         let persona = soul_watcher.current();
-        let system_prompt = compile_system_prompt(&persona.render(), &[]);
-        let messages = vec![
-            Message::new(Role::System, &system_prompt),
-            Message::new(Role::User, transcript),
-        ];
-        let events = llm
-            .chat(ChatRequest {
+        let system_prompt = match embed_pipeline {
+            Some(pipeline) => {
+                let mut pipeline = pipeline.lock().await;
+                match compile_prompt_with_retrieval(
+                    history_store,
+                    &mut *pipeline,
+                    &persona.render(),
+                    &transcript,
+                    MEMORY_RETRIEVAL_K,
+                ) {
+                    Ok(prompt) => prompt,
+                    Err(err) => {
+                        tracing::error!(%err, "memory retrieval failed; falling back to plain system prompt");
+                        compile_system_prompt(&persona.render(), &[])
+                    }
+                }
+            }
+            None => compile_system_prompt(&persona.render(), &[]),
+        };
+
+        // Persist the user's turn (EPIC 10.1/10.2) and fold it into the
+        // working context before building the request — a restart later
+        // resumes with this same turn via `recent_context`.
+        turn_buffer.push_user(transcript.clone());
+        log_turn_async(
+            history_store,
+            NewTurn {
+                session_id: DEFAULT_SESSION_ID.to_string(),
+                timestamp_ms: now_ms(),
+                role: "user".to_string(),
+                text: transcript.clone(),
+                provenance: Trust::User,
+                interrupted: false,
+            },
+        )
+        .await;
+
+        let context_window = llm.info().context_window;
+        let messages = turn_buffer.messages_for_request(&system_prompt, context_window);
+        let policy = persona.tool_policy();
+        let tools = broker.catalog();
+        let max_iterations = resolve_max_iterations(config.llm.max_tool_iterations_per_turn);
+        let max_tokens = config.llm.max_tokens_per_turn;
+
+        // `think` (EPIC 6.3) drives the whole tool-call loop itself instead
+        // of just returning a `ChatEventStream`, so it runs on its own
+        // task; its `on_text` callback feeds an mpsc channel wrapped as a
+        // `ChatEventStream` — the same seam [`sentence_chunk`] already
+        // consumes — so speech still starts on the first sentence rather
+        // than waiting for the whole tool loop (and every tool call in it)
+        // to finish. The channel's sender lives only inside `think`'s own
+        // closure, so it drops (ending the stream, flushing any trailing
+        // partial sentence) the instant `think` returns.
+        let (text_tx, mut text_rx) =
+            tokio::sync::mpsc::unbounded_channel::<Result<ChatEvent, marceline_core::EngineError>>();
+        let think_broker = Arc::clone(broker);
+        let think_cancel = run_token.clone();
+        let think_task = tokio::spawn(async move {
+            think(
+                &llm,
+                &think_broker,
                 messages,
-                tools: Vec::new(),
-                max_tokens: config.llm.max_tokens_per_turn,
-            })
-            .await;
+                tools,
+                &policy,
+                max_tokens,
+                max_iterations,
+                think_cancel,
+                // No real voice-confirmation path exists yet (EPIC 6.5/9.3
+                // built the seam, nothing speaks a prompt yet); every real
+                // tool today is `ReadOnly` (§10) so this is never actually
+                // consulted — fail closed if that ever changes.
+                &DeclineAll,
+                move |delta: &str| {
+                    let _ = text_tx.send(Ok(ChatEvent::TextDelta(delta.to_string())));
+                },
+            )
+            .await
+        });
+        let events: ChatEventStream =
+            Box::pin(futures::stream::poll_fn(move |cx| text_rx.poll_recv(cx)));
         let mut sentences = sentence_chunk(events);
 
         // First sentence pulled eagerly, under `think_timeout`: this is
@@ -644,7 +845,19 @@ async fn run_loop(
                 continue;
             }
         };
-        let rest: marceline_core::TextStream = Box::pin(sentences);
+        // Tees each sentence into `full_reply` as it is pulled for TTS, so
+        // the final (possibly partial, if cancelled mid-speech) reply text
+        // is available to log below without buffering it twice.
+        let full_reply = Arc::new(Mutex::new(first_sentence.clone()));
+        let full_reply_for_stream = Arc::clone(&full_reply);
+        let rest: marceline_core::TextStream = Box::pin(sentences.inspect(move |item| {
+            if let Ok(text) = item {
+                full_reply_for_stream
+                    .lock()
+                    .expect("full_reply lock poisoned")
+                    .push_str(text);
+            }
+        }));
         let text_stream: marceline_core::TextStream = Box::pin(
             futures::stream::once(async move { Ok(first_sentence) }).chain(rest),
         );
@@ -712,10 +925,8 @@ async fn run_loop(
                     // the length of whatever was already buffered.
                     cancelled = run_token.is_cancelled();
                     if cancelled {
-                        // Partial-state policy (§2.5.1): until EPIC 10's
-                        // history store exists, marking the turn
-                        // `interrupted` means logging it — there is
-                        // nowhere else to record it yet.
+                        // Partial-state policy (§2.5.1): the reply logged
+                        // below is marked `interrupted` rather than dropped.
                         tracing::info!(interrupted = true, "turn cancelled mid-speech");
                     }
                     let _ = orchestrator
@@ -742,6 +953,92 @@ async fn run_loop(
             .await
             .ok();
         state_tx.send_replace(orchestrator.state());
+
+        // The tool loop finished speaking its text well before this point
+        // (it only needs to have produced *some* text, not have returned),
+        // so this join is normally instant — it exists to surface an
+        // iteration-cap warning or a `think` failure that never showed up
+        // as a `ChatEvent` (e.g. a cancellation between tool-call rounds).
+        match think_task.await {
+            Ok(Ok((outcome, _messages))) if outcome.iteration_cap_hit => {
+                tracing::warn!(max_iterations, "tool iteration cap hit; forced a final answer");
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => tracing::error!(%err, "thinking loop failed"),
+            Err(err) => tracing::error!(%err, "think task panicked"),
+        }
+
+        // Persist the assistant's turn (EPIC 10.1/10.2), interrupted or
+        // not, and fold it into the working context for the next turn.
+        let reply_text = full_reply
+            .lock()
+            .expect("full_reply lock poisoned")
+            .clone();
+        if !reply_text.is_empty() {
+            turn_buffer.push_assistant(reply_text.clone());
+            log_turn_async(
+                history_store,
+                NewTurn {
+                    session_id: DEFAULT_SESSION_ID.to_string(),
+                    timestamp_ms: now_ms(),
+                    role: "assistant".to_string(),
+                    text: reply_text,
+                    provenance: Trust::Assistant,
+                    interrupted: cancelled,
+                },
+            )
+            .await;
+
+            // Distill this session's recent turns into a durable memory in
+            // the background (EPIC 10.4) — off the turn path, so it never
+            // adds latency to a spoken reply.
+            if let Some(pipeline) = embed_pipeline.cloned() {
+                let store = history_store.clone();
+                let llm_config = config.llm.clone();
+                tokio::spawn(async move {
+                    let engine = match OpenAiCompatibleEngine::new(&llm_config, CancellationToken::new())
+                    {
+                        Ok(engine) => engine,
+                        Err(err) => {
+                            tracing::error!(%err, "background summarizer could not build an llm engine");
+                            return;
+                        }
+                    };
+                    let summarizer = LlmSummarizer::new(engine, SUMMARIZER_MAX_TOKENS);
+                    // Not `summarize_session` directly: that function holds
+                    // its `&mut dyn EmbeddingPipeline` argument across its
+                    // own internal `.await`, which makes the resulting
+                    // future `!Send` and unspawnable — inlined here instead,
+                    // so the concrete `MiniLmEmbedder` guard is only
+                    // touched by the synchronous `store_memory` call, never
+                    // held across an `.await` point.
+                    let turns = match store.recent_turns(DEFAULT_SESSION_ID, SUMMARY_TURN_LIMIT) {
+                        Ok(turns) => turns,
+                        Err(err) => {
+                            tracing::error!(%err, "background summarizer could not read recent turns");
+                            return;
+                        }
+                    };
+                    if turns.is_empty() {
+                        return;
+                    }
+                    let provenance = marceline_core::derive_provenance(&turns);
+                    let summary = match summarizer.summarize(&turns).await {
+                        Ok(summary) => summary,
+                        Err(err) => {
+                            tracing::error!(%err, "background summarization failed");
+                            return;
+                        }
+                    };
+                    let mut pipeline = pipeline.lock().await;
+                    if let Err(err) =
+                        marceline_core::store_memory(&store, &mut *pipeline, summary, provenance, now_ms())
+                    {
+                        tracing::error!(%err, "failed to store distilled memory");
+                    }
+                });
+            }
+        }
     }
 }
 
