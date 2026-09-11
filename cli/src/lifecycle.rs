@@ -93,6 +93,18 @@ pub async fn run_daemon_process(args: &[String]) -> ExitCode {
     let dir = daemon::runtime_dir(&config.memory.expanded_db_path());
     let control_socket = daemon::control_socket_path(&dir);
     let pidfile = daemon::pidfile_path(&dir);
+
+    // Held for this process's entire lifetime (assigned to a variable
+    // rather than discarded) — a second daemon that somehow still gets
+    // spawned while this one is alive fails this lock immediately instead
+    // of racing it for the control socket and the microphone.
+    let _pidfile_lock = match daemon::try_lock_pidfile(&pidfile) {
+        Ok(lock) => lock,
+        Err(err) => {
+            eprintln!("failed to acquire pidfile lock at {}: {err}", pidfile.display());
+            return ExitCode::FAILURE;
+        }
+    };
     if let Err(err) = daemon::write_pidfile(&pidfile, std::process::id()) {
         eprintln!("failed to write pidfile at {}: {err}", pidfile.display());
         return ExitCode::FAILURE;
@@ -119,13 +131,29 @@ async fn run_start(
     pidfile: &Path,
     control_socket: &Path,
 ) -> ExitCode {
-    if let Some(pid) = daemon::read_pidfile(pidfile) {
-        if is_alive(pid) {
+    // Held for this whole check-then-spawn sequence so two concurrent
+    // `marceline start` invocations can't both pass the liveness check
+    // below and each launch a daemon.
+    let pidfile_lock = match daemon::try_lock_pidfile(pidfile) {
+        Ok(lock) => lock,
+        Err(daemon::LockError::AlreadyLocked) => {
+            println!("marceline is already starting or running (pidfile is locked)");
+            return ExitCode::SUCCESS;
+        }
+        Err(err) => {
+            eprintln!("failed to acquire pidfile lock at {}: {err}", pidfile.display());
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if let Some((pid, start_time)) = daemon::read_pidfile(pidfile) {
+        if daemon::is_recorded_process_alive(pid, start_time) {
             println!("marceline is already running (pid {pid})");
             return ExitCode::SUCCESS;
         }
-        // Stale pidfile from an unclean previous exit — clear it before
-        // starting fresh so nothing downstream mistakes it for a live pid.
+        // Either nothing is running at `pid`, or the pid was reused by an
+        // unrelated process since — either way this pidfile is stale, not
+        // live, so it's cleared rather than mistaken for either.
         daemon::remove_pidfile(pidfile);
     }
 
@@ -162,6 +190,13 @@ async fn run_start(
         }
     };
 
+    // Released here, just before spawning: the daemon process takes its
+    // own lock on the same path for its whole lifetime (see
+    // `run_daemon_process`), which is the lock that actually matters once
+    // it exists. Holding this one any longer would only make the daemon's
+    // own lock attempt fail against its own parent.
+    drop(pidfile_lock);
+
     let child = Command::new("setsid")
         .arg(&current_exe)
         .arg("__daemon-run")
@@ -184,7 +219,7 @@ async fn run_start(
     // for the control socket to come up before reporting success.
     let deadline = std::time::Instant::now() + START_READY_TIMEOUT;
     loop {
-        if let Some(pid) = daemon::read_pidfile(pidfile) {
+        if let Some((pid, _)) = daemon::read_pidfile(pidfile) {
             if daemon::send_request(control_socket, &ControlRequest::Status)
                 .await
                 .is_ok()
@@ -209,11 +244,11 @@ async fn run_start(
 /// `marceline stop`: sends SIGTERM and waits for the daemon to exit,
 /// following the shutdown ordering documented on `converse::converse_ex`.
 async fn run_stop(pidfile: &Path, control_socket: &Path) -> ExitCode {
-    let Some(pid) = daemon::read_pidfile(pidfile) else {
+    let Some((pid, start_time)) = daemon::read_pidfile(pidfile) else {
         println!("marceline is not running");
         return ExitCode::SUCCESS;
     };
-    if !is_alive(pid) {
+    if !daemon::is_recorded_process_alive(pid, start_time) {
         println!("marceline is not running (stale pidfile removed)");
         daemon::remove_pidfile(pidfile);
         return ExitCode::SUCCESS;
@@ -225,7 +260,7 @@ async fn run_stop(pidfile: &Path, control_socket: &Path) -> ExitCode {
     }
 
     let deadline = std::time::Instant::now() + STOP_WAIT_TIMEOUT;
-    while is_alive(pid) {
+    while daemon::is_recorded_process_alive(pid, start_time) {
         if std::time::Instant::now() >= deadline {
             eprintln!("pid {pid} did not exit within {}s; sending SIGKILL", STOP_WAIT_TIMEOUT.as_secs());
             send_signal(pid, "-KILL");
@@ -243,11 +278,11 @@ async fn run_stop(pidfile: &Path, control_socket: &Path) -> ExitCode {
 /// `marceline status`: reports per-stage health and the current
 /// conversation state against a live daemon.
 async fn run_status(pidfile: &Path, control_socket: &Path) -> ExitCode {
-    let Some(pid) = daemon::read_pidfile(pidfile) else {
+    let Some((pid, start_time)) = daemon::read_pidfile(pidfile) else {
         println!("marceline is not running");
         return ExitCode::FAILURE;
     };
-    if !is_alive(pid) {
+    if !daemon::is_recorded_process_alive(pid, start_time) {
         println!("marceline is not running (stale pidfile present)");
         return ExitCode::FAILURE;
     }
@@ -273,19 +308,6 @@ async fn run_status(pidfile: &Path, control_socket: &Path) -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-/// Whether a process with `pid` currently exists, via `kill -0` — no
-/// dependency on `libc`/`nix` for one syscall's worth of behavior.
-fn is_alive(pid: u32) -> bool {
-    Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
 }
 
 /// Sends `signal` (e.g. `"-TERM"`, `"-KILL"`) to `pid` via the `kill`

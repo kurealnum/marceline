@@ -329,6 +329,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "ort",
  "protocol",
  "reqwest",
