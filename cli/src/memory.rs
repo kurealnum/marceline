@@ -32,15 +32,6 @@ use marceline_core::{
 /// unless the operator asks for more.
 const DEFAULT_TURN_LIMIT: usize = 20;
 
-/// Default directory `MiniLmEmbedder::load` reads `model.onnx` +
-/// `tokenizer.json` from, relative to this crate — mirrors `converse.rs`'s
-/// `models/silero_vad.onnx` convention. Not vendored in this repo (the
-/// weights are a network download), so this is the path that is expected to
-/// exist once an operator fetches the model, not something this sandbox can
-/// exercise end to end.
-fn default_model_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/all-MiniLM-L6-v2")
-}
 
 /// Renders a [`Trust`] the way a human reading the CLI output wants to see
 /// it — the same three strings `history.rs` persists in the `provenance`
@@ -91,9 +82,11 @@ fn open_store(config_path: &Path) -> Result<HistoryStore, String> {
 /// model fails gracefully rather than panicking.
 fn open_pipeline(config_path: &Path, model_dir: Option<&Path>) -> Result<MiniLmEmbedder, String> {
     let config = Config::load(config_path).map_err(|err| format!("failed to load config: {err}"))?;
-    let model_dir = model_dir
-        .map(Path::to_path_buf)
-        .unwrap_or_else(default_model_dir);
+    let model_dir = match model_dir {
+        Some(dir) => dir.to_path_buf(),
+        None => marceline_core::paths::embed_model_dir()
+            .map_err(|err| format!("failed to locate embedding model: {err}"))?,
+    };
     MiniLmEmbedder::load(&model_dir, config.memory.embed_model.clone()).map_err(|err| {
         format!(
             "failed to load embedding model from {}: {err}\n\

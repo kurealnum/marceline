@@ -16,6 +16,7 @@ pub mod logging;
 pub mod mcp;
 pub mod memory;
 pub mod orchestrator;
+pub mod paths;
 pub mod soul;
 pub mod soul_watch;
 pub mod stt;

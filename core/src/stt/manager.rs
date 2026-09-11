@@ -20,7 +20,7 @@
 //!   engine, so the connection replaced underneath them is not their
 //!   problem.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -75,13 +75,15 @@ pub struct SttWorkerPaths {
 }
 
 impl SttWorkerPaths {
-    /// Paths for a backend name, relative to the repository root.
+    /// Paths for a backend name, under `workers_root` (see
+    /// [`crate::paths::workers_root`] — resolved by the caller so this
+    /// stays infallible and testable without touching the filesystem).
     ///
     /// `whisper` and `faster-whisper` are separate worker directories, so
     /// the backend selects which script runs — the mechanism by which
     /// `[stt].backend` swaps implementations (EPIC 3.5).
-    pub fn for_backend(backend: &str) -> Self {
-        let dir = PathBuf::from("workers").join(backend_dir(backend));
+    pub fn for_backend(backend: &str, workers_root: &Path) -> Self {
+        let dir = workers_root.join(backend_dir(backend));
         Self {
             python: dir.join(".venv/bin/python"),
             script: dir.join("worker.py"),
@@ -230,7 +232,16 @@ impl SttManager {
 
         let current = supervised.spec.borrow().clone();
         let paths = match backend {
-            Some(backend) => SttWorkerPaths::for_backend(backend),
+            Some(backend) => {
+                let workers_root = supervised
+                    .paths
+                    .script
+                    .parent()
+                    .and_then(Path::parent)
+                    .expect("script is always workers_root/<backend>/worker.py")
+                    .to_path_buf();
+                SttWorkerPaths::for_backend(backend, &workers_root)
+            }
             None => supervised.paths.clone(),
         };
 
@@ -368,7 +379,7 @@ mod tests {
 
     #[test]
     fn whisper_backend_maps_to_the_default_worker_directory() {
-        let paths = SttWorkerPaths::for_backend("whisper");
+        let paths = SttWorkerPaths::for_backend("whisper", &PathBuf::from("workers"));
         assert_eq!(paths.script, PathBuf::from("workers/stt/worker.py"));
         assert_eq!(paths.python, PathBuf::from("workers/stt/.venv/bin/python"));
     }
@@ -376,7 +387,7 @@ mod tests {
     #[test]
     fn an_unknown_backend_uses_its_own_directory_name() {
         // Adding a worker directory is enough to add a backend.
-        let paths = SttWorkerPaths::for_backend("faster-whisper");
+        let paths = SttWorkerPaths::for_backend("faster-whisper", &PathBuf::from("workers"));
         assert_eq!(
             paths.script,
             PathBuf::from("workers/faster-whisper/worker.py")
@@ -392,7 +403,7 @@ mod tests {
             lang: "en".to_string(),
             guard: Default::default(),
         };
-        let spec = worker_spec(&config, &SttWorkerPaths::for_backend(&config.backend));
+        let spec = worker_spec(&config, &SttWorkerPaths::for_backend(&config.backend, &PathBuf::from("workers")));
 
         assert_eq!(spec.name, WORKER_NAME);
         assert_eq!(spec.model_id, "large-v3");
