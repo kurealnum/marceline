@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Sample, SampleFormat, Stream, StreamConfig};
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, TrySendError};
 
 use super::device_select::resolve;
 use super::ring::PreRollRing;
@@ -70,11 +70,22 @@ impl Capture {
             sample_rate,
             channels,
         )));
-        let (tx, rx) = crossbeam_channel::unbounded();
+        // Bounded rather than unbounded: nothing downstream drains this
+        // channel during TRANSCRIBING/THINKING/SPEAKING (EPIC 2, `run_loop`
+        // only reads it while listening for a wake word or collecting an
+        // utterance), so an unbounded channel would grow for the length of
+        // every turn and then replay minutes-old, possibly self-recorded
+        // audio into the wake detector the moment the loop returns to
+        // IDLE. Capacity is sized to roughly the pre-roll window, which is
+        // the same "how much recent audio matters" judgment call the
+        // pre-roll ring already makes.
+        let capacity = preroll_chunk_capacity(preroll_seconds);
+        let (tx, rx) = crossbeam_channel::bounded(capacity);
         let seq = Arc::new(AtomicU64::new(0));
 
         let ctx = CallbackCtx {
             tx,
+            rx: rx.clone(),
             preroll: Arc::clone(&preroll),
             seq: Arc::clone(&seq),
             sample_rate,
@@ -122,6 +133,7 @@ impl Capture {
 #[derive(Clone)]
 struct CallbackCtx {
     tx: Sender<AudioChunk>,
+    rx: Receiver<AudioChunk>,
     preroll: Arc<Mutex<PreRollRing>>,
     seq: Arc<AtomicU64>,
     sample_rate: u32,
@@ -190,5 +202,56 @@ fn handle_frames(data: &[f32], ctx: &CallbackCtx) {
         sample_rate: ctx.sample_rate,
         channels: ctx.channels,
     };
-    let _ = ctx.tx.send(chunk);
+    send_dropping_oldest(&ctx.tx, &ctx.rx, chunk);
+}
+
+/// Sends `chunk` on `tx`, dropping the oldest queued chunk to make room
+/// when the bounded channel is full, rather than blocking the audio
+/// callback or growing without limit.
+fn send_dropping_oldest(tx: &Sender<AudioChunk>, rx: &Receiver<AudioChunk>, chunk: AudioChunk) {
+    match tx.try_send(chunk) {
+        Ok(()) => {}
+        Err(TrySendError::Full(chunk)) => {
+            let _ = rx.try_recv();
+            tracing::warn!("mic capture queue full, dropping oldest chunk");
+            let _ = tx.try_send(chunk);
+        }
+        Err(TrySendError::Disconnected(_)) => {}
+    }
+}
+
+/// Capacity, in chunks, of the bounded mic capture channel: roughly the
+/// pre-roll window's worth of audio, assuming ~20ms callback buffers (a
+/// common `cpal` default) — good enough as a safety-net bound, not a
+/// precise timing guarantee.
+fn preroll_chunk_capacity(preroll_seconds: f32) -> usize {
+    const ASSUMED_CHUNKS_PER_SECOND: f32 = 50.0;
+    ((preroll_seconds * ASSUMED_CHUNKS_PER_SECOND).ceil() as usize).max(8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chunk(seq: u64) -> AudioChunk {
+        AudioChunk {
+            seq,
+            pcm: vec![0.0],
+            sample_rate: 16_000,
+            channels: 1,
+        }
+    }
+
+    #[test]
+    fn pushing_past_capacity_drops_the_oldest_not_the_newest() {
+        let (tx, rx) = crossbeam_channel::bounded(4);
+
+        for seq in 0..10 {
+            send_dropping_oldest(&tx, &rx, chunk(seq));
+        }
+
+        assert_eq!(rx.len(), 4, "queue stays bounded, not accumulating");
+        let received: Vec<u64> = std::iter::from_fn(|| rx.try_recv().ok()).map(|c| c.seq).collect();
+        assert_eq!(received, vec![6, 7, 8, 9], "oldest dropped, newest kept, order preserved");
+    }
 }
