@@ -49,7 +49,7 @@ use marceline_core::{
     HistoryError, HistoryStore, LlmEngine, LlmSummarizer, ListDirTool, MemoryError, MiniLmEmbedder,
     NewTurn, OpenAiCompatibleEngine, Orchestrator, Playback, ReadFileTool, SileroVad, SttManager,
     Stages, Summarizer, ToolBroker, TtsEngine, TurnBuffer, Trust, VadEndpointer, VoiceId,
-    WebSearchTool, DEFAULT_SPEECH_THRESHOLD,
+    WebSearchTool, WorkerState, DEFAULT_SPEECH_THRESHOLD,
 };
 use marceline_core::audio::Capture;
 use tokio::sync::{watch, Mutex as AsyncMutex, RwLock};
@@ -261,6 +261,25 @@ pub async fn converse(config_path: &Path, soul_path: &Path) -> Result<(), Conver
 /// waits to observe that happening before it returns.
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Interval between health-view polls while waiting for workers to report
+/// [`WorkerState::Stopped`] during shutdown.
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Waits until every worker known to `stt_health`/`tts_health` reports
+/// [`WorkerState::Stopped`], polling rather than sleeping a fixed amount —
+/// the caller wraps this in a [`tokio::time::timeout`] so it can never hang
+/// shutdown indefinitely.
+async fn wait_for_workers_stopped(stt_health: &HealthView, tts_health: &HealthView) {
+    loop {
+        let stt_done = stt_health.read().await.values().all(|s| *s == WorkerState::Stopped);
+        let tts_done = tts_health.read().await.values().all(|s| *s == WorkerState::Stopped);
+        if stt_done && tts_done {
+            return;
+        }
+        tokio::time::sleep(SHUTDOWN_POLL_INTERVAL).await;
+    }
+}
+
 /// [`converse`], with an optional `control_socket` (EPIC 11.1's daemon
 /// mode, driven by `marceline start`/`stop`/`status`).
 ///
@@ -424,6 +443,10 @@ pub async fn converse_ex(
     // side. Starts at `Idle` — `run_loop`'s first iteration republishes it
     // immediately anyway.
     let (state_tx, state_rx) = watch::channel(ConversationState::Idle);
+    // Kept for step 6's shutdown wait below — the clones passed to
+    // `control_task` are moved into that task's closure.
+    let stt_health_for_shutdown = Arc::clone(&stt_health_for_status);
+    let tts_health_for_shutdown = Arc::clone(&tts_health_for_status);
     let control_task = control_socket.map(|socket_path| {
         let socket_path = socket_path.to_path_buf();
         let stt_manager_for_status = Arc::clone(&stt_manager);
@@ -447,6 +470,13 @@ pub async fn converse_ex(
     // currently in flight" (§2.5.1).
     let current_run: CurrentRun = Arc::new(Mutex::new(None));
     let ctrlc_run = Arc::clone(&current_run);
+    // Ctrl-c while idle used to call `std::process::exit(0)`, which runs no
+    // destructors and skips the graceful shutdown ordering entirely —
+    // worker shutdown channels never fire, the control socket and pidfile
+    // are left behind. Firing this instead routes idle ctrl-c through the
+    // exact same ordering SIGTERM takes, below.
+    let shutdown_requested = CancellationToken::new();
+    let ctrlc_shutdown = shutdown_requested.clone();
     tokio::spawn(async move {
         loop {
             if tokio::signal::ctrl_c().await.is_err() {
@@ -456,15 +486,20 @@ pub async fn converse_ex(
                 // A turn is in flight: cancel it (same path barge-in will
                 // ride, EPIC 7) rather than killing the process outright.
                 Some(token) => token.cancel(),
-                // Idle: nothing to cancel, so ctrl-c means "exit".
-                None => std::process::exit(0),
+                // Idle: nothing to cancel, so ctrl-c means "exit" — via the
+                // graceful path, not std::process::exit.
+                None => {
+                    ctrlc_shutdown.cancel();
+                    return;
+                }
             }
         }
     });
 
     // SIGTERM drives the graceful ordering below (SPEC.md §2.5.1, EPIC
-    // 11.1's `marceline stop`); ctrl-c above stays the interactive
-    // "cancel this turn, or exit if idle" shortcut it always was.
+    // 11.1's `marceline stop`); ctrl-c above shares that same ordering,
+    // either cancelling the in-flight turn or (if idle) firing
+    // `shutdown_requested` to reach it directly.
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("failed to install SIGTERM handler");
 
@@ -503,6 +538,12 @@ pub async fn converse_ex(
             }
             Ok(())
         }
+        _ = shutdown_requested.cancelled() => {
+            tracing::info!("ctrl-c received while idle; running graceful shutdown ordering (SPEC.md §2.5.1)");
+            // Idle by construction (this only fires from the `None` arm
+            // above): nothing to cancel, nothing buffered to drain.
+            Ok(())
+        }
     };
 
     // (4) checkpoint memory/history to SQLite: a no-op here — every turn's
@@ -512,10 +553,21 @@ pub async fn converse_ex(
     // (5) signal the STT/TTS workers to exit.
     let _ = stt_shutdown_tx.send(true);
     let _ = tts_shutdown_tx.send(true);
-    // (6) wait, bounded, for that to land; a still-running child is
-    // hard-killed by the supervisor's own shutdown path (EPIC 0.6), not by
-    // this function.
-    let _ = tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, tokio::time::sleep(Duration::from_millis(200))).await;
+    // (6) wait, bounded, for both workers to actually report `Stopped` in
+    // their health view — not a fixed sleep that observes nothing. A
+    // worker that hasn't stopped by the timeout is logged so the miss is
+    // visible instead of silent; the supervisor's own `kill_on_drop`
+    // reclaims it regardless once this process exits.
+    let drained = tokio::time::timeout(
+        SHUTDOWN_DRAIN_TIMEOUT,
+        wait_for_workers_stopped(&stt_health_for_shutdown, &tts_health_for_shutdown),
+    )
+    .await;
+    if drained.is_err() {
+        let stt_states = stt_health_for_shutdown.read().await.clone();
+        let tts_states = tts_health_for_shutdown.read().await.clone();
+        tracing::warn!(?stt_states, ?tts_states, "worker(s) did not report stopped before shutdown timeout");
+    }
     soul_watch_cancel.cancel();
     let _ = soul_watch_handle.await;
     if let Some(task) = control_task {

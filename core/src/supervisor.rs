@@ -60,7 +60,12 @@ impl WorkerSpec {
             .arg("--model-id")
             .arg(&self.model_id)
             .arg("--device")
-            .arg(self.device.as_str());
+            .arg(self.device.as_str())
+            // If the supervisor task is ever dropped or aborted without
+            // reaching its graceful shutdown branch, the OS still kills
+            // this child rather than leaving a GPU-memory-holding orphan
+            // behind.
+            .kill_on_drop(true);
         cmd
     }
 }
