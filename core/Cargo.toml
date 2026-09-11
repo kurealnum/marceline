@@ -52,6 +52,10 @@ sqlite-vec = "0.1.9"
 # to compile at all without it. `onig_sys` vendors its own oniguruma C
 # source, so this still builds fully offline via `cc`.
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+# Direct pid liveness/identity checks and an advisory flock on the pidfile
+# (EPIC 11.1), instead of forking `kill`/checking pid numbers alone — both
+# of which are exposed to pid reuse after an unclean exit.
+libc = "0.2"
 
 [dev-dependencies]
 # The STT client tests run a fake `Stt` server over a real unix socket,

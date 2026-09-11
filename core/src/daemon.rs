@@ -18,7 +18,9 @@
 //! requires owning/permission over that process, same as any other unix
 //! signal).
 
+use std::fs::{File, OpenOptions};
 use std::io;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -51,23 +53,102 @@ pub fn control_socket_path(dir: &Path) -> PathBuf {
     dir.join("control.sock")
 }
 
-/// Writes `pid` to `path`, creating `path`'s parent directory if needed.
+/// Writes `pid` and its process start time to `path`, creating `path`'s
+/// parent directory if needed.
+///
+/// The start time (not just the pid) is what makes [`read_pidfile`]'s
+/// result safe to signal without checking further: a bare pid can be
+/// reused by an unrelated process within minutes of an unclean exit (the
+/// Linux pid counter is often capped at 32768), and signalling by pid
+/// alone can't tell the two apart.
 pub fn write_pidfile(path: &Path, pid: u32) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, pid.to_string())
+    let start_time = process_start_time(pid).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, format!("no /proc entry for pid {pid}"))
+    })?;
+    std::fs::write(path, format!("{pid}:{start_time}"))
 }
 
-/// Reads the pid stored at `path`, if the file exists and parses cleanly.
-pub fn read_pidfile(path: &Path) -> Option<u32> {
-    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+/// Reads the `(pid, start_time)` recorded at `path`, if the file exists
+/// and parses cleanly. Does not by itself confirm the process is still
+/// alive or still the same one — see [`is_recorded_process_alive`].
+pub fn read_pidfile(path: &Path) -> Option<(u32, u64)> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let (pid, start_time) = contents.trim().split_once(':')?;
+    Some((pid.parse().ok()?, start_time.parse().ok()?))
 }
 
 /// Removes the pidfile at `path`, ignoring a missing file (already gone is
 /// the goal state, not an error).
 pub fn remove_pidfile(path: &Path) {
     let _ = std::fs::remove_file(path);
+}
+
+/// Whether `pid` is alive *and* is the same process that recorded
+/// `start_time` — a mismatch (pid alive but a different start time) means
+/// the pid was reused by something else and the pidfile is stale, not
+/// live.
+pub fn is_recorded_process_alive(pid: u32, start_time: u64) -> bool {
+    process_start_time(pid) == Some(start_time)
+}
+
+/// Parses field 22 (`starttime`, in clock ticks since boot) out of
+/// `/proc/<pid>/stat`.
+///
+/// Skips to just after the last `)` rather than splitting naively on
+/// whitespace: field 2 (`comm`, the executable name in parens) can itself
+/// contain spaces, so the field count before it is unreliable, but
+/// `comm`'s closing paren is always the last `)` in the line (the kernel
+/// escapes literal `)` inside `comm` — see `man proc(5)`).
+fn process_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rsplit_once(')')?.1;
+    after_comm.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// An advisory exclusive lock on the pidfile, held for as long as this
+/// value lives — `flock` releases automatically when the underlying file
+/// descriptor closes, so there is nothing to do on drop beyond that.
+pub struct PidfileLock {
+    _file: File,
+}
+
+/// Why [`try_lock_pidfile`] failed.
+#[derive(Debug, thiserror::Error)]
+pub enum LockError {
+    /// Another process already holds the lock.
+    #[error("pidfile is already locked by another process")]
+    AlreadyLocked,
+    /// Opening or locking the file failed for some other reason.
+    #[error("failed to lock pidfile: {0}")]
+    Io(#[from] io::Error),
+}
+
+/// Takes a non-blocking exclusive lock on `path`, creating it if absent.
+///
+/// `marceline start` holds this for the length of its check-then-spawn
+/// sequence so two concurrent `start` invocations can't both pass the
+/// liveness check and each launch a daemon; the daemon process itself
+/// takes its own lock on the same path for its entire lifetime (see
+/// module docs), so a second daemon that somehow still gets spawned fails
+/// this lock immediately instead of binding a socket another daemon owns.
+pub fn try_lock_pidfile(path: &Path) -> Result<PidfileLock, LockError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = OpenOptions::new().create(true).write(true).open(path)?;
+    let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if ret == 0 {
+        return Ok(PidfileLock { _file: file });
+    }
+    let err = io::Error::last_os_error();
+    if err.kind() == io::ErrorKind::WouldBlock {
+        Err(LockError::AlreadyLocked)
+    } else {
+        Err(LockError::Io(err))
+    }
 }
 
 /// One request the CLI can send over the control socket.
@@ -325,18 +406,43 @@ mod tests {
     fn pidfile_round_trips_and_creates_its_parent_directory() {
         let dir = tempfile::tempdir().unwrap();
         let path = pidfile_path(&dir.path().join("nested"));
+        // Needs a pid `/proc` can actually answer for — the test process
+        // itself.
+        let pid = std::process::id();
 
-        write_pidfile(&path, 4242).unwrap();
-        assert_eq!(read_pidfile(&path), Some(4242));
+        write_pidfile(&path, pid).unwrap();
+        let (read_pid, start_time) = read_pidfile(&path).expect("pidfile round-trips");
+        assert_eq!(read_pid, pid);
+        assert!(is_recorded_process_alive(pid, start_time));
 
         remove_pidfile(&path);
         assert_eq!(read_pidfile(&path), None);
     }
 
     #[test]
+    fn a_reused_pid_with_a_different_start_time_is_not_the_recorded_process() {
+        let pid = std::process::id();
+        let real_start_time = process_start_time(pid).expect("test process has a /proc entry");
+        assert!(!is_recorded_process_alive(pid, real_start_time.wrapping_add(1)));
+    }
+
+    #[test]
     fn reading_a_missing_pidfile_is_none_not_an_error() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(read_pidfile(&pidfile_path(dir.path())), None);
+    }
+
+    #[test]
+    fn a_second_lock_on_the_same_pidfile_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = pidfile_path(dir.path());
+
+        let first = try_lock_pidfile(&path).expect("first lock succeeds");
+        let second = try_lock_pidfile(&path);
+        assert!(matches!(second, Err(LockError::AlreadyLocked)));
+
+        drop(first);
+        try_lock_pidfile(&path).expect("lock is released when the holder drops");
     }
 
     #[tokio::test]
