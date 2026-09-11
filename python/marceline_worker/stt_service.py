@@ -40,6 +40,8 @@ from grpc_health.v1 import health, health_pb2, health_pb2_grpc
 
 from marceline_protocol import stt_pb2, stt_pb2_grpc
 
+from marceline_worker.socket_security import prepare_socket_path, secure_socket_permissions
+
 from .audio import resample, to_mono
 
 # Name the supervisor's health check asks for.
@@ -372,11 +374,15 @@ def build_server(
     health_servicer = health.HealthServicer()
     health_pb2_grpc.add_HealthServicer_to_server(health_servicer, server)
 
-    # Remove a stale socket file from a previous, uncleanly-killed run.
-    if os.path.exists(socket_path):
-        os.unlink(socket_path)
+    # Remove a stale socket file from a previous, uncleanly-killed run of
+    # this same user; refuse (rather than silently replace) one owned by
+    # someone else.
+    prepare_socket_path(socket_path)
 
     server.add_insecure_port(f"unix://{socket_path}")
+    # Set explicitly rather than trusting the umask: this socket carries a
+    # live microphone feed and must not be connectable by another user.
+    secure_socket_permissions(socket_path)
     return server, health_servicer
 
 

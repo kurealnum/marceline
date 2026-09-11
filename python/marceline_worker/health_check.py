@@ -7,7 +7,7 @@ loading its model, and prints the capabilities it reports — so
 backend, since they all serve the same contract. The Rust supervisor
 (EPIC 0.6) performs the same health check.
 
-    python -m marceline_worker.health_check --socket-path /tmp/marceline-stt.sock
+    python -m marceline_worker.health_check --socket-path $XDG_RUNTIME_DIR/marceline/stt.sock
 """
 
 import argparse

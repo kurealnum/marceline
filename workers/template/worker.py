@@ -68,11 +68,17 @@ def build_server(socket_path: str) -> tuple[grpc.Server, health.HealthServicer]:
     health_servicer = health.HealthServicer()
     health_pb2_grpc.add_HealthServicer_to_server(health_servicer, server)
 
-    # Remove a stale socket file from a previous, uncleanly-killed run.
-    if os.path.exists(socket_path):
-        os.unlink(socket_path)
+    # Remove a stale socket file from a previous, uncleanly-killed run of
+    # this same user; refuse (rather than silently replace) one owned by
+    # someone else — the socket path is expected to live in a per-user
+    # runtime directory (see `marceline_worker.socket_security`), not a
+    # shared one like `/tmp`.
+    from marceline_worker.socket_security import prepare_socket_path, secure_socket_permissions
+
+    prepare_socket_path(socket_path)
 
     server.add_insecure_port(f"unix://{socket_path}")
+    secure_socket_permissions(socket_path)
     return server, health_servicer
 
 

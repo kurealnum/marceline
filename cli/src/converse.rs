@@ -88,6 +88,9 @@ pub enum ConverseError {
     /// Checking/re-embedding the long-term memory index at startup failed.
     #[error(transparent)]
     Memory(#[from] MemoryError),
+    /// Preparing the per-user worker socket directory failed.
+    #[error("failed to prepare the worker socket directory: {0}")]
+    WorkerSocketDir(#[from] std::io::Error),
 }
 
 /// A short, fixed message spoken on any non-TTS stage failure (SPEC.md
@@ -383,7 +386,10 @@ pub async fn converse_ex(
     // cancellation token (see module docs, EPIC 8.4). The `SttManager`/
     // engine values returned here exist only to prove the worker came up —
     // no further calls go through them.
-    let stt_paths = SttWorkerPaths::for_backend(&config.stt.backend);
+    let worker_socket_dir = marceline_core::daemon::worker_socket_dir(&config.memory.expanded_db_path());
+    marceline_core::daemon::ensure_private_dir(&worker_socket_dir)?;
+
+    let stt_paths = SttWorkerPaths::for_backend(&config.stt.backend, &worker_socket_dir);
     let stt_socket = stt_paths.socket_path.clone();
     let (stt_shutdown_tx, stt_shutdown_rx) = watch::channel(false);
     let stt_health: HealthView = Arc::new(RwLock::new(HashMap::new()));
@@ -404,7 +410,7 @@ pub async fn converse_ex(
         .await?,
     );
 
-    let tts_paths = TtsWorkerPaths::for_backend(&config.tts.backend);
+    let tts_paths = TtsWorkerPaths::for_backend(&config.tts.backend, &worker_socket_dir);
     let tts_socket = tts_paths.socket_path.clone();
     let (tts_shutdown_tx, tts_shutdown_rx) = watch::channel(false);
     let tts_health: HealthView = Arc::new(RwLock::new(HashMap::new()));

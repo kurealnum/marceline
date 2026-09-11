@@ -385,6 +385,18 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
 /// Reads a worker spec field from an environment variable, falling back to
 /// `default` when unset. Lets the epic-0 demo script point at the worker
 /// template without hardcoding paths in the binary.
+/// Default socket path for the epic-0 demo stub worker: a per-user
+/// directory ([`marceline_core::daemon::worker_socket_dir`]), not the old
+/// fixed `/tmp/marceline-worker.sock` — a shared path any local user could
+/// connect to or squat before this process starts.
+fn default_stub_socket_path() -> String {
+    let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let db_path = PathBuf::from(home).join(".marceline").join("history.db");
+    let dir = marceline_core::daemon::worker_socket_dir(&db_path);
+    let _ = marceline_core::daemon::ensure_private_dir(&dir);
+    dir.join("worker.sock").to_string_lossy().into_owned()
+}
+
 fn env_or(var: &str, default: &str) -> String {
     env::var(var).unwrap_or_else(|_| default.to_string())
 }
@@ -403,7 +415,10 @@ async fn run(verbose: bool) {
             "workers/template/.venv/bin/python",
         )),
         script: PathBuf::from(env_or("WORKER_SCRIPT", "workers/template/worker.py")),
-        socket_path: PathBuf::from(env_or("WORKER_SOCKET", "/tmp/marceline-worker.sock")),
+        socket_path: PathBuf::from(env_or(
+            "WORKER_SOCKET",
+            &default_stub_socket_path(),
+        )),
         model_id: env_or("WORKER_MODEL_ID", "template"),
         device: env_or("WORKER_DEVICE", "cpu")
             .parse::<Device>()

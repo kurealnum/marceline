@@ -39,6 +39,9 @@ pub enum SayError {
     /// Creating or writing the `.wav` file failed.
     #[error(transparent)]
     WavTap(#[from] marceline_core::WavTapError),
+    /// Preparing the per-user worker socket directory failed.
+    #[error("failed to prepare the worker socket directory: {0}")]
+    WorkerSocketDir(#[from] std::io::Error),
 }
 
 /// Speaks `text` through the `[tts]` backend named in the config at
@@ -61,7 +64,9 @@ pub async fn say(config_path: &Path, wav_path: &Path, text: &str) -> Result<(), 
     // supervisor to stop the worker we are about to use.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let health: HealthView = Arc::new(RwLock::new(HashMap::new()));
-    let paths = TtsWorkerPaths::for_backend(&config.tts.backend);
+    let socket_dir = marceline_core::daemon::worker_socket_dir(&config.memory.expanded_db_path());
+    marceline_core::daemon::ensure_private_dir(&socket_dir)?;
+    let paths = TtsWorkerPaths::for_backend(&config.tts.backend, &socket_dir);
 
     let engine = marceline_core::launch_tts_worker(
         &config.tts,

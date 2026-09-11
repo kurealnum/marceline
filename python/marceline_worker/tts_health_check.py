@@ -6,7 +6,7 @@ loading its model, and prints the voice ids and sample rate it reports.
 Works against any TTS backend, since they all serve the same contract.
 The Rust supervisor (EPIC 0.6) performs the same health check.
 
-    python -m marceline_worker.tts_health_check --socket-path /tmp/marceline-tts.sock
+    python -m marceline_worker.tts_health_check --socket-path $XDG_RUNTIME_DIR/marceline/tts.sock
 """
 
 import argparse

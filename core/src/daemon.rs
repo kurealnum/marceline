@@ -19,6 +19,7 @@
 //! signal).
 
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -49,6 +50,29 @@ pub fn pidfile_path(dir: &Path) -> PathBuf {
 /// Path to the daemon's control socket within `dir` (see [`runtime_dir`]).
 pub fn control_socket_path(dir: &Path) -> PathBuf {
     dir.join("control.sock")
+}
+
+/// Directory the STT/TTS worker sockets live in: `$XDG_RUNTIME_DIR/marceline`
+/// when `XDG_RUNTIME_DIR` is set (the systemd/logind-managed per-user,
+/// per-boot tmpfs — mode 0700 by construction), otherwise [`runtime_dir`]
+/// (`~/.marceline/`, same as the pidfile and control socket).
+///
+/// Either way the directory is per-user, unlike the old fixed
+/// `/tmp/marceline-*.sock` paths: those let any local user connect to a
+/// live microphone feed, or squat the path before Marceline starts and
+/// have the client stream audio straight to them.
+pub fn worker_socket_dir(db_path: &Path) -> PathBuf {
+    match std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+        Some(xdg) => PathBuf::from(xdg).join("marceline"),
+        None => runtime_dir(db_path),
+    }
+}
+
+/// Creates `dir` (and parents) if needed and ensures it is mode `0700` —
+/// entrant only by its owner — regardless of umask.
+pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
 }
 
 /// Writes `pid` to `path`, creating `path`'s parent directory if needed.
@@ -337,6 +361,42 @@ mod tests {
     fn reading_a_missing_pidfile_is_none_not_an_error() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(read_pidfile(&pidfile_path(dir.path())), None);
+    }
+
+    #[test]
+    fn worker_socket_dir_prefers_xdg_runtime_dir_then_falls_back() {
+        // Both assertions live in one test (rather than two) because they
+        // mutate the same process-wide env var and `cargo test` runs tests
+        // in parallel by default within a binary.
+        let previous = std::env::var_os("XDG_RUNTIME_DIR");
+
+        std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000");
+        assert_eq!(
+            worker_socket_dir(Path::new("/home/user/.marceline/history.db")),
+            PathBuf::from("/run/user/1000/marceline")
+        );
+
+        std::env::remove_var("XDG_RUNTIME_DIR");
+        assert_eq!(
+            worker_socket_dir(Path::new("/home/user/.marceline/history.db")),
+            PathBuf::from("/home/user/.marceline")
+        );
+
+        match previous {
+            Some(value) => std::env::set_var("XDG_RUNTIME_DIR", value),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
+    }
+
+    #[test]
+    fn ensure_private_dir_creates_the_directory_mode_0700() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("nested/sockets");
+
+        ensure_private_dir(&dir).unwrap();
+
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
     }
 
     #[tokio::test]
