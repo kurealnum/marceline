@@ -131,6 +131,7 @@ fn event_stream(
 ) -> impl Stream<Item = Result<ChatEvent, EngineError>> + Send {
     let state = SseState {
         bytes: Box::pin(response.bytes_stream()),
+        raw: Vec::new(),
         buf: String::new(),
         pending: Vec::new(),
         current_tool_call: None,
@@ -169,10 +170,39 @@ fn event_stream(
 
             match chunk {
                 Some(Ok(bytes)) => {
-                    state.buf.push_str(&String::from_utf8_lossy(&bytes));
+                    state.raw.extend_from_slice(&bytes);
+                    match std::str::from_utf8(&state.raw) {
+                        Ok(text) => {
+                            state.buf.push_str(text);
+                            state.raw.clear();
+                        }
+                        Err(err) => {
+                            // The invalid tail may just be a multi-byte
+                            // character split across this chunk and the
+                            // next — move the valid prefix into `buf` and
+                            // keep the rest of `raw` for the next chunk.
+                            let valid_len = err.valid_up_to();
+                            let text = std::str::from_utf8(&state.raw[..valid_len])
+                                .expect("valid_up_to bounds valid utf8");
+                            state.buf.push_str(text);
+                            state.raw.drain(..valid_len);
+                        }
+                    }
                 }
                 Some(Err(err)) => return Some((Err(transport_error(err)), None)),
                 None => {
+                    if !state.raw.is_empty() {
+                        // Bytes left over at stream end can't be a split
+                        // character waiting for more data — this is a
+                        // genuine protocol error.
+                        return Some((
+                            Err(EngineError::Protocol {
+                                backend: BACKEND,
+                                message: "stream ended with invalid trailing utf-8".to_string(),
+                            }),
+                            None,
+                        ));
+                    }
                     // The connection closed without a terminal `[DONE]` or
                     // `finish_reason` — the contract was violated, not
                     // merely ended.
@@ -192,6 +222,9 @@ fn event_stream(
 /// Per-stream state carried across `unfold` steps.
 struct SseState {
     bytes: Pin<Box<dyn Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>,
+    /// Bytes received but not yet valid UTF-8 — holds the tail of a
+    /// multi-byte character until the rest of it arrives in a later chunk.
+    raw: Vec<u8>,
     buf: String,
     /// Events parsed but not yet yielded — a single SSE line can imply more
     /// than one [`ChatEvent`] (e.g. closing the previous tool call before
