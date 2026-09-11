@@ -88,6 +88,10 @@ pub enum ConverseError {
     /// Checking/re-embedding the long-term memory index at startup failed.
     #[error(transparent)]
     Memory(#[from] MemoryError),
+    /// A worker or model file could not be found at any candidate location
+    /// (EPIC 11's installability requirement).
+    #[error(transparent)]
+    MissingResource(#[from] marceline_core::paths::MissingResourceError),
 }
 
 /// A short, fixed message spoken on any non-TTS stage failure (SPEC.md
@@ -214,11 +218,11 @@ const SUMMARY_TURN_LIMIT: usize = 20;
 const SUMMARIZER_MAX_TOKENS: u32 = 200;
 
 /// Default directory `MiniLmEmbedder::load` reads `model.onnx` +
-/// `tokenizer.json` from, relative to this crate — mirrors `memory.rs`'s
-/// identical helper and `converse.rs`'s own `models/silero_vad.onnx`
-/// convention.
-fn default_embed_model_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/all-MiniLM-L6-v2")
+/// `tokenizer.json` from — resolved via [`marceline_core::paths`] rather
+/// than a checkout-relative path, mirroring `memory.rs`'s identical
+/// helper.
+fn default_embed_model_dir() -> Result<PathBuf, marceline_core::paths::MissingResourceError> {
+    marceline_core::paths::embed_model_dir()
 }
 
 /// Current Unix epoch milliseconds, for [`NewTurn::timestamp_ms`].
@@ -353,7 +357,7 @@ pub async fn converse_ex(
     // model directory then fails startup with a clear error rather than
     // silently running without long-term memory.
     let embed_pipeline: Option<Arc<AsyncMutex<MiniLmEmbedder>>> = if config.memory.longterm {
-        let model_dir = default_embed_model_dir();
+        let model_dir = default_embed_model_dir()?;
         let mut pipeline = MiniLmEmbedder::load(&model_dir, config.memory.embed_model.clone())?;
         let store_for_check = history_store.clone();
         tokio::task::spawn_blocking(move || -> Result<MiniLmEmbedder, MemoryError> {
@@ -370,7 +374,7 @@ pub async fn converse_ex(
     let capture = Capture::start(1.5, config.audio.input_device.as_deref())?;
     let detector = EnergyWakeDetector::new(config.wake.sensitivity, 16_000, 1600);
     let wake = marceline_core::WakeEngine::new(&config.wake, Box::new(detector));
-    let model_path = format!("{}/models/silero_vad.onnx", env!("CARGO_MANIFEST_DIR"));
+    let model_path = marceline_core::paths::vad_model_path()?;
     let vad = SileroVad::load(&model_path)?;
     let endpointer = VadEndpointer::new(vad, DEFAULT_SPEECH_THRESHOLD);
     let mut gate = Gate::new(wake, endpointer, &config.vad);
@@ -383,7 +387,8 @@ pub async fn converse_ex(
     // cancellation token (see module docs, EPIC 8.4). The `SttManager`/
     // engine values returned here exist only to prove the worker came up —
     // no further calls go through them.
-    let stt_paths = SttWorkerPaths::for_backend(&config.stt.backend);
+    let workers_root = marceline_core::paths::workers_root()?;
+    let stt_paths = SttWorkerPaths::for_backend(&config.stt.backend, &workers_root);
     let stt_socket = stt_paths.socket_path.clone();
     let (stt_shutdown_tx, stt_shutdown_rx) = watch::channel(false);
     let stt_health: HealthView = Arc::new(RwLock::new(HashMap::new()));
@@ -404,7 +409,7 @@ pub async fn converse_ex(
         .await?,
     );
 
-    let tts_paths = TtsWorkerPaths::for_backend(&config.tts.backend);
+    let tts_paths = TtsWorkerPaths::for_backend(&config.tts.backend, &workers_root);
     let tts_socket = tts_paths.socket_path.clone();
     let (tts_shutdown_tx, tts_shutdown_rx) = watch::channel(false);
     let tts_health: HealthView = Arc::new(RwLock::new(HashMap::new()));

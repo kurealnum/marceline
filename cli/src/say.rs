@@ -39,6 +39,10 @@ pub enum SayError {
     /// Creating or writing the `.wav` file failed.
     #[error(transparent)]
     WavTap(#[from] marceline_core::WavTapError),
+    /// The TTS worker's script/venv could not be found at any candidate
+    /// location.
+    #[error(transparent)]
+    MissingResource(#[from] marceline_core::paths::MissingResourceError),
 }
 
 /// Speaks `text` through the `[tts]` backend named in the config at
@@ -61,7 +65,8 @@ pub async fn say(config_path: &Path, wav_path: &Path, text: &str) -> Result<(), 
     // supervisor to stop the worker we are about to use.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let health: HealthView = Arc::new(RwLock::new(HashMap::new()));
-    let paths = TtsWorkerPaths::for_backend(&config.tts.backend);
+    let workers_root = marceline_core::paths::workers_root()?;
+    let paths = TtsWorkerPaths::for_backend(&config.tts.backend, &workers_root);
 
     let engine = marceline_core::launch_tts_worker(
         &config.tts,

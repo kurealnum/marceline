@@ -49,6 +49,10 @@ pub enum TranscribeFileError {
         /// Which check rejected it, and the measurement behind it.
         reason: String,
     },
+    /// The STT worker's script/venv could not be found at any candidate
+    /// location.
+    #[error(transparent)]
+    MissingResource(#[from] marceline_core::paths::MissingResourceError),
 }
 
 /// How to reach an STT worker.
@@ -98,7 +102,8 @@ pub async fn transcribe_file(
                 model = %config.stt.model,
                 "launching stt worker from config"
             );
-            let paths = SttWorkerPaths::for_backend(&config.stt.backend);
+            let workers_root = marceline_core::paths::workers_root()?;
+            let paths = SttWorkerPaths::for_backend(&config.stt.backend, &workers_root);
             let health: HealthView = Arc::new(RwLock::new(HashMap::new()));
             SttManager::start(&config.stt, paths, health, shutdown_rx, cancel).await?
         }
