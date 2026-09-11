@@ -90,6 +90,36 @@ fn user_request(text: &str) -> ChatRequest {
 }
 
 #[tokio::test]
+async fn text_sharing_a_chunk_with_finish_reason_is_not_dropped() {
+    let chunks = vec![
+        (Duration::ZERO, sse_line(r#"{"choices":[{"delta":{"content":"!"},"finish_reason":"stop"}]}"#)),
+        (Duration::ZERO, "data: [DONE]\n\n".to_string()),
+    ];
+    let base_url = start_fake_server(chunks).await;
+    let config = test_config(base_url);
+    let engine = OpenAiCompatibleEngine::new(&config, CancellationToken::new()).expect("engine");
+
+    let events: Vec<_> = engine
+        .chat(user_request("hello"))
+        .await
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(|item| item.expect("no stream error"))
+        .collect();
+
+    assert_eq!(
+        events,
+        vec![
+            ChatEvent::TextDelta("!".to_string()),
+            ChatEvent::Done {
+                finish_reason: FinishReason::Stop
+            },
+        ]
+    );
+}
+
+#[tokio::test]
 async fn streams_ordered_text_deltas_then_done() {
     let chunks = vec![
         (Duration::ZERO, sse_line(r#"{"choices":[{"delta":{"content":"Hel"},"finish_reason":null}]}"#)),

@@ -253,14 +253,11 @@ fn parse_sse_line(
         return Some(Ok(()));
     };
 
-    if let Some(finish_reason) = choice.finish_reason {
-        close_current_tool_call(current_tool_call, pending);
-        pending.push(ChatEvent::Done {
-            finish_reason: finish_reason_from_wire(&finish_reason),
-        });
-        return Some(Ok(()));
-    }
-
+    // A backend may put the last content/tool-call fragment in the same
+    // chunk as `finish_reason` (llama.cpp, vLLM, Ollama commonly do), unlike
+    // strict OpenAI which always sends an empty trailing delta. Push the
+    // delta's events first so they precede `Done` in `pending` instead of
+    // being dropped by an early return.
     if let Some(content) = choice.delta.content {
         if !content.is_empty() {
             pending.push(ChatEvent::TextDelta(content));
@@ -296,6 +293,13 @@ fn parse_sse_line(
             id,
             name,
             args_delta,
+        });
+    }
+
+    if let Some(finish_reason) = choice.finish_reason {
+        close_current_tool_call(current_tool_call, pending);
+        pending.push(ChatEvent::Done {
+            finish_reason: finish_reason_from_wire(&finish_reason),
         });
     }
 
