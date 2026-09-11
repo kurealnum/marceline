@@ -19,6 +19,9 @@ api_key_env = "MARCELINE_LLM_KEY"
 max_tokens_per_turn = 2048
 max_requests_per_session = 200
 max_tool_iterations_per_turn = 8
+# Model's context window in tokens, used to trim conversation history.
+# Set to 0 to disable trimming.
+context_window = 8192
 
 [tts]
 backend = "kokoro"

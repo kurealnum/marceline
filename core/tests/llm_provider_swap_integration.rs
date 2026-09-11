@@ -77,6 +77,7 @@ fn config_for(base_url: String, env_var: &'static str) -> LlmConfig {
         max_tokens_per_turn: 512,
         max_requests_per_session: 100,
         max_tool_iterations_per_turn: 4,
+        context_window: 8_192,
     }
 }
 

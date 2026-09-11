@@ -71,7 +71,7 @@ impl OpenAiCompatibleEngine {
             api_key,
             info: LlmInfo {
                 name: format!("{}:{}", config.backend, config.model),
-                context_window: 0,
+                context_window: config.context_window,
                 supports_tools: true,
                 streaming: true,
             },

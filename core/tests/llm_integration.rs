@@ -78,6 +78,7 @@ fn test_config(base_url: String) -> LlmConfig {
         max_tokens_per_turn: 512,
         max_requests_per_session: 100,
         max_tool_iterations_per_turn: 4,
+        context_window: 8_192,
     }
 }
 
@@ -87,6 +88,16 @@ fn user_request(text: &str) -> ChatRequest {
         tools: vec![],
         max_tokens: 512,
     }
+}
+
+#[tokio::test]
+async fn engine_info_reports_the_configured_context_window() {
+    let base_url = start_fake_server(vec![]).await;
+    let mut config = test_config(base_url);
+    config.context_window = 32_768;
+    let engine = OpenAiCompatibleEngine::new(&config, CancellationToken::new()).expect("engine");
+
+    assert_eq!(engine.info().context_window, 32_768);
 }
 
 #[tokio::test]
