@@ -12,17 +12,24 @@
 //! Shutdown itself does *not* go through this socket: per SPEC.md §11.1,
 //! `marceline stop` sends SIGTERM directly to the daemon's pid (from the
 //! pidfile below) and the daemon's own SIGTERM handler runs the graceful
-//! ordering (§2.5.1). Keeping the control socket read-only (status queries
-//! only) means a client that can merely connect can never trigger a
-//! shutdown it wasn't otherwise allowed to (sending a signal to the pid
-//! requires owning/permission over that process, same as any other unix
-//! signal).
+//! ordering (§2.5.1).
+//!
+//! The socket is *not* read-only, though: [`ControlRequest::SwapSttModel`]
+//! (EPIC 11.2) restarts the STT worker on a caller-chosen model id and
+//! backend directory, which is a real privileged action, not a status
+//! query. What actually restricts who can do that is [`serve_control`]
+//! checking the connecting peer's uid against the daemon's own
+//! (`SO_PEERCRED`, via [`tokio::net::UnixStream::peer_cred`]) and the
+//! socket living in a mode-0700 directory with mode 0600 permissions —
+//! belt and suspenders, since either alone would be enough on a
+//! correctly-configured filesystem.
 
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::watch;
 
@@ -245,6 +252,20 @@ pub async fn send_request(
 /// unclean previous exit is removed first, since `UnixListener::bind`
 /// fails with `AddrInUse` on an existing path even if nothing is listening
 /// on it.
+/// Longest a single control request line is allowed to be. Generous for
+/// any real [`ControlRequest`] (the longest is `SwapSttModel`'s two short
+/// strings) but bounded, so a connected client can't grow the daemon's
+/// memory without limit by sending an endless line.
+const MAX_CONTROL_LINE_BYTES: u64 = 4096;
+
+/// The current process's real uid, for comparing against a connecting
+/// control-socket peer's ([`serve_control`]).
+fn current_uid() -> u32 {
+    // SAFETY: `getuid()` takes no arguments, performs no pointer access,
+    // and cannot fail per POSIX.
+    unsafe { libc::getuid() }
+}
+
 pub async fn serve_control(
     socket_path: &Path,
     stt_health: HealthView,
@@ -252,11 +273,45 @@ pub async fn serve_control(
     state: watch::Receiver<ConversationState>,
     stt: Option<std::sync::Arc<crate::stt::SttManager>>,
 ) -> io::Result<()> {
+    // Explicit rather than trusting the umask: `SwapSttModel` is a real
+    // privileged action (see module docs), and the directory permissions
+    // are the outer layer of that — the peer-uid check below is the inner
+    // one, in case the directory or umask is ever misconfigured.
+    if let Some(dir) = socket_path.parent() {
+        std::fs::create_dir_all(dir)?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
     let _ = std::fs::remove_file(socket_path);
     let listener = tokio::net::UnixListener::bind(socket_path)?;
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
+    let own_uid = current_uid();
 
     loop {
-        let (stream, _addr) = listener.accept().await?;
+        let (stream, _addr) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(err) => {
+                // A still-running daemon whose control socket has stopped
+                // accepting is worse than one accept failure: `status`
+                // would never work again for the rest of this process's
+                // life with only one log line to explain why. Log and
+                // keep serving instead.
+                tracing::error!(%err, "control socket accept failed; continuing to serve");
+                continue;
+            }
+        };
+
+        match stream.peer_cred() {
+            Ok(cred) if cred.uid() == own_uid => {}
+            Ok(cred) => {
+                tracing::warn!(peer_uid = cred.uid(), own_uid, "rejecting control connection from another user");
+                continue;
+            }
+            Err(err) => {
+                tracing::warn!(%err, "could not verify control connection's peer credentials, rejecting");
+                continue;
+            }
+        }
+
         let stt_health = stt_health.clone();
         let tts_health = tts_health.clone();
         let state = state.clone();
@@ -265,8 +320,21 @@ pub async fn serve_control(
             let (read_half, mut write_half) = stream.into_split();
             let mut reader = BufReader::new(read_half);
             let mut line = String::new();
-            if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
-                return;
+            // Bounded rather than a bare `read_line`: an unbounded read
+            // lets a connected client grow the daemon's memory without
+            // limit by never sending a newline.
+            let read = (&mut reader).take(MAX_CONTROL_LINE_BYTES).read_line(&mut line).await;
+            match read {
+                Ok(0) => return,
+                Ok(_) if line.as_bytes().last() != Some(&b'\n') => {
+                    // Hit the byte cap before a newline arrived — a
+                    // malformed or hostile request, not a valid one that
+                    // happened to be long.
+                    tracing::warn!("control request exceeded the max line length, dropping connection");
+                    return;
+                }
+                Ok(_) => {}
+                Err(_) => return,
             }
             let Ok(request) = serde_json::from_str::<ControlRequest>(line.trim_end()) else {
                 return;
@@ -375,6 +443,58 @@ mod tests {
         assert!(report
             .workers
             .contains(&("tts".to_string(), StageHealth::Restarting)));
+    }
+
+    #[tokio::test]
+    async fn the_socket_is_mode_0600_in_a_mode_0700_directory() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("runtime");
+        let socket_path = control_socket_path(&dir);
+
+        let stt_health: HealthView = Arc::new(RwLock::new(HashMap::new()));
+        let tts_health: HealthView = Arc::new(RwLock::new(HashMap::new()));
+        let (_state_tx, state_rx) = watch::channel(ConversationState::Idle);
+
+        let socket_for_server = socket_path.clone();
+        tokio::spawn(async move {
+            let _ = serve_control(&socket_for_server, stt_health, tts_health, state_rx, None).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        let socket_mode = std::fs::metadata(&socket_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(socket_mode, 0o600);
+    }
+
+    #[tokio::test]
+    async fn a_request_line_over_the_length_cap_gets_disconnected_not_buffered() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = control_socket_path(dir.path());
+
+        let stt_health: HealthView = Arc::new(RwLock::new(HashMap::new()));
+        let tts_health: HealthView = Arc::new(RwLock::new(HashMap::new()));
+        let (_state_tx, state_rx) = watch::channel(ConversationState::Idle);
+
+        let socket_for_server = socket_path.clone();
+        tokio::spawn(async move {
+            let _ = serve_control(&socket_for_server, stt_health, tts_health, state_rx, None).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let stream = UnixStream::connect(&socket_path).await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        // No newline anywhere in this — a client trying to grow the
+        // daemon's memory with an endless line, not a valid oversized
+        // request.
+        let oversized = vec![b'a'; (MAX_CONTROL_LINE_BYTES * 2) as usize];
+        let _ = write_half.write_all(&oversized).await;
+        let _ = write_half.flush().await;
+
+        let mut reader = BufReader::new(read_half);
+        let mut response_line = String::new();
+        let n = reader.read_line(&mut response_line).await.unwrap_or(0);
+        assert_eq!(n, 0, "connection closed with no response, not a buffered reply");
     }
 
     #[tokio::test]
