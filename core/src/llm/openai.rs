@@ -133,7 +133,7 @@ fn event_stream(
         bytes: Box::pin(response.bytes_stream()),
         buf: String::new(),
         pending: Vec::new(),
-        current_tool_call: None,
+        open_tool_calls: Vec::new(),
         done: false,
     };
 
@@ -150,7 +150,7 @@ fn event_stream(
 
             if let Some(line) = state.take_buffered_line() {
                 if let Some(Err(err)) =
-                    parse_sse_line(&line, &mut state.current_tool_call, &mut state.pending)
+                    parse_sse_line(&line, &mut state.open_tool_calls, &mut state.pending)
                 {
                     return Some((Err(err), None));
                 }
@@ -197,10 +197,10 @@ struct SseState {
     /// than one [`ChatEvent`] (e.g. closing the previous tool call before
     /// opening the next, or closing the last tool call before `Done`).
     pending: Vec<ChatEvent>,
-    /// `(index, id)` of the tool call currently accumulating arguments, per
-    /// the wire format's `tool_calls[].index` — OpenAI-compatible backends
-    /// stream one tool call to completion before starting the next.
-    current_tool_call: Option<(u32, String)>,
+    /// `(index, id)` of every tool call currently accumulating arguments,
+    /// per the wire format's `tool_calls[].index` — a backend may stream
+    /// more than one call in parallel, so this isn't a single slot.
+    open_tool_calls: Vec<(u32, String)>,
     done: bool,
 }
 
@@ -216,14 +216,16 @@ impl SseState {
 
 /// Parses one raw SSE line, pushing zero or more events onto `pending`.
 ///
-/// `current_tool_call` tracks the in-flight call's wire `index` and id: the
-/// OpenAI wire format has no explicit "this tool call is done" message, so
-/// a new index (or the stream's `finish_reason`/`Done`) is what implies the
-/// previous call finished, and that implied [`ChatEvent::ToolCallDone`] is
-/// pushed before whatever triggered it.
+/// `open_tool_calls` tracks every in-flight call by wire `index` and id,
+/// oldest-opened first: a backend may stream more than one tool call in
+/// parallel within the same delta (`tool_calls` is an array), so a single
+/// slot isn't enough. The OpenAI wire format has no explicit "this tool
+/// call is done" message, so the stream's `finish_reason`/`Done` is what
+/// implies every open call finished, and those implied
+/// [`ChatEvent::ToolCallDone`]s are pushed before whatever triggered it.
 fn parse_sse_line(
     line: &str,
-    current_tool_call: &mut Option<(u32, String)>,
+    open_tool_calls: &mut Vec<(u32, String)>,
     pending: &mut Vec<ChatEvent>,
 ) -> Option<Result<(), EngineError>> {
     let line = line.trim();
@@ -232,7 +234,7 @@ fn parse_sse_line(
     }
     let payload = line["data:".len()..].trim();
     if payload == "[DONE]" {
-        close_current_tool_call(current_tool_call, pending);
+        close_open_tool_calls(open_tool_calls, pending);
         pending.push(ChatEvent::Done {
             finish_reason: FinishReason::Stop,
         });
@@ -253,37 +255,27 @@ fn parse_sse_line(
         return Some(Ok(()));
     };
 
-    if let Some(finish_reason) = choice.finish_reason {
-        close_current_tool_call(current_tool_call, pending);
-        pending.push(ChatEvent::Done {
-            finish_reason: finish_reason_from_wire(&finish_reason),
-        });
-        return Some(Ok(()));
-    }
-
     if let Some(content) = choice.delta.content {
         if !content.is_empty() {
             pending.push(ChatEvent::TextDelta(content));
         }
     }
 
-    if let Some(call) = choice.delta.tool_calls.and_then(|calls| calls.into_iter().next()) {
+    for call in choice.delta.tool_calls.into_iter().flatten() {
         let index = call.index;
         let id = call.id.unwrap_or_default();
 
-        let is_new_call = match current_tool_call {
-            Some((current_index, _)) if *current_index == index => false,
-            _ => {
-                close_current_tool_call(current_tool_call, pending);
-                true
-            }
-        };
+        let is_new_call = !open_tool_calls.iter().any(|(open_index, _)| *open_index == index);
 
         let id = if is_new_call {
-            *current_tool_call = Some((index, id.clone()));
+            open_tool_calls.push((index, id.clone()));
             id
         } else {
-            current_tool_call.as_ref().map(|(_, id)| id.clone()).unwrap_or(id)
+            open_tool_calls
+                .iter()
+                .find(|(open_index, _)| *open_index == index)
+                .map(|(_, id)| id.clone())
+                .unwrap_or(id)
         };
 
         let name = if is_new_call {
@@ -299,13 +291,20 @@ fn parse_sse_line(
         });
     }
 
+    if let Some(finish_reason) = choice.finish_reason {
+        close_open_tool_calls(open_tool_calls, pending);
+        pending.push(ChatEvent::Done {
+            finish_reason: finish_reason_from_wire(&finish_reason),
+        });
+    }
+
     Some(Ok(()))
 }
 
-/// Pushes [`ChatEvent::ToolCallDone`] for the in-flight tool call, if any,
-/// and clears it.
-fn close_current_tool_call(current_tool_call: &mut Option<(u32, String)>, pending: &mut Vec<ChatEvent>) {
-    if let Some((_, id)) = current_tool_call.take() {
+/// Pushes [`ChatEvent::ToolCallDone`] for every in-flight tool call, oldest
+/// first, and clears them.
+fn close_open_tool_calls(open_tool_calls: &mut Vec<(u32, String)>, pending: &mut Vec<ChatEvent>) {
+    for (_, id) in open_tool_calls.drain(..) {
         pending.push(ChatEvent::ToolCallDone { id });
     }
 }
