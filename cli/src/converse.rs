@@ -88,6 +88,9 @@ pub enum ConverseError {
     /// Checking/re-embedding the long-term memory index at startup failed.
     #[error(transparent)]
     Memory(#[from] MemoryError),
+    /// The `read_file`/`list_dir` sandbox root could not be resolved.
+    #[error("failed to resolve the tool sandbox root: {0}")]
+    ToolSandboxRoot(#[from] std::io::Error),
 }
 
 /// A short, fixed message spoken on any non-TTS stage failure (SPEC.md
@@ -221,6 +224,18 @@ fn default_embed_model_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/all-MiniLM-L6-v2")
 }
 
+/// Root `read_file`/`list_dir` are confined to (issue #185): explicit and
+/// small rather than the whole filesystem. `MARCELINE_TOOLS_ROOT`
+/// overrides it; otherwise it's the current working directory — the
+/// directory the operator actually launched the daemon from, not
+/// something implicit like `$HOME`.
+fn tool_sandbox_root() -> std::io::Result<PathBuf> {
+    match std::env::var_os("MARCELINE_TOOLS_ROOT") {
+        Some(dir) => Ok(PathBuf::from(dir)),
+        None => std::env::current_dir(),
+    }
+}
+
 /// Current Unix epoch milliseconds, for [`NewTurn::timestamp_ms`].
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -317,11 +332,16 @@ pub async fn converse_ex(
     broker
         .register(Arc::new(GetTimeTool))
         .expect("get_time is the first registration");
+    let tool_sandbox_root = tool_sandbox_root()?;
     broker
-        .register(Arc::new(ReadFileTool))
+        .register(Arc::new(ReadFileTool::new(marceline_core::tools::sandbox::Sandbox::new(
+            &tool_sandbox_root,
+        )?)))
         .expect("read_file is the first registration");
     broker
-        .register(Arc::new(ListDirTool))
+        .register(Arc::new(ListDirTool::new(marceline_core::tools::sandbox::Sandbox::new(
+            &tool_sandbox_root,
+        )?)))
         .expect("list_dir is the first registration");
     broker
         .register(Arc::new(WebSearchTool::new()?))
