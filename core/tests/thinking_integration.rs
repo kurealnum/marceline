@@ -117,6 +117,7 @@ fn test_config(base_url: String) -> LlmConfig {
         max_tokens_per_turn: 512,
         max_requests_per_session: 100,
         max_tool_iterations_per_turn: 8,
+        context_window: 8_192,
     }
 }
 

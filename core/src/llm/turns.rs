@@ -58,13 +58,14 @@ impl TrimPolicy for DropOldestTurn {
 ///
 /// No tokenizer is wired in (that would tie this crate to a specific
 /// provider's vocabulary, defeating the point of being OpenAI-standard
-/// generic). The ~4-chars-per-token heuristic is deliberately conservative
-/// enough that trimming happens a little early rather than a request
-/// exceeding the window because the estimate undercounted.
+/// generic). ~4 chars/token undercounts badly for non-English text (CJK in
+/// particular can run close to 1 char/token), so this uses ~2 chars/token —
+/// conservative enough that trimming happens a little early rather than a
+/// request exceeding the window because the estimate undercounted.
 fn estimate_tokens(turns: &[Message]) -> u32 {
     turns
         .iter()
-        .map(|m| (m.content.len() as u32) / 4 + 4)
+        .map(|m| (m.content.len() as u32) / 2 + 4)
         .sum()
 }
 
@@ -223,6 +224,23 @@ mod tests {
         assert_eq!(second_request[1].content, "my name is Oscar");
         assert_eq!(second_request[2].content, "Nice to meet you, Oscar!");
         assert_eq!(second_request[3].content, "what is my name?");
+    }
+
+    #[test]
+    fn a_turn_buffer_seeded_past_the_window_trims_via_messages_for_request() {
+        // Mirrors the path `cli::converse::run_loop` drives: a buffer
+        // pre-seeded from history (`TurnBuffer::from_turns`), then trimmed
+        // to a small configured window on the next request.
+        let mut buffer = TurnBuffer::from_turns(vec![
+            long_turn(Role::User, 400),
+            long_turn(Role::Assistant, 400),
+            long_turn(Role::User, 20),
+        ]);
+
+        let messages = buffer.messages_for_request("sys", 20);
+
+        assert_eq!(messages.len(), 2, "system prompt + the one surviving turn");
+        assert_eq!(messages[1].content.len(), 20);
     }
 
     #[test]

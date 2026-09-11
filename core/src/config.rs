@@ -89,6 +89,20 @@ pub struct LlmConfig {
     pub max_requests_per_session: u32,
     /// Max tool-call iterations allowed per turn before forcing a final answer.
     pub max_tool_iterations_per_turn: u32,
+    /// The model's context window in tokens, used to trim conversation
+    /// history (`DropOldestTurn`, SPEC.md §9.10). OpenAI-compatible
+    /// endpoints don't report this portably, so it has to come from config.
+    /// Set to `0` to disable trimming on purpose. Defaults for configs
+    /// predating this field.
+    #[serde(default = "default_context_window")]
+    pub context_window: u32,
+}
+
+/// Default for [`LlmConfig::context_window`]: conservative enough to fit
+/// small local models without trimming away a whole config's worth of
+/// history it didn't need to.
+fn default_context_window() -> u32 {
+    8_192
 }
 
 impl LlmConfig {
