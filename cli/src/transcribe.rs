@@ -49,6 +49,9 @@ pub enum TranscribeFileError {
         /// Which check rejected it, and the measurement behind it.
         reason: String,
     },
+    /// Preparing the per-user worker socket directory failed.
+    #[error("failed to prepare the worker socket directory: {0}")]
+    WorkerSocketDir(#[from] std::io::Error),
 }
 
 /// How to reach an STT worker.
@@ -98,7 +101,9 @@ pub async fn transcribe_file(
                 model = %config.stt.model,
                 "launching stt worker from config"
             );
-            let paths = SttWorkerPaths::for_backend(&config.stt.backend);
+            let socket_dir = marceline_core::daemon::worker_socket_dir(&config.memory.expanded_db_path());
+            marceline_core::daemon::ensure_private_dir(&socket_dir)?;
+            let paths = SttWorkerPaths::for_backend(&config.stt.backend, &socket_dir);
             let health: HealthView = Arc::new(RwLock::new(HashMap::new()));
             SttManager::start(&config.stt, paths, health, shutdown_rx, cancel).await?
         }

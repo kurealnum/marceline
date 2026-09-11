@@ -80,12 +80,17 @@ impl SttWorkerPaths {
     /// `whisper` and `faster-whisper` are separate worker directories, so
     /// the backend selects which script runs — the mechanism by which
     /// `[stt].backend` swaps implementations (EPIC 3.5).
-    pub fn for_backend(backend: &str) -> Self {
+    ///
+    /// `socket_dir` (see [`crate::daemon::worker_socket_dir`]) is a
+    /// per-user directory, not a fixed path — a socket at a shared,
+    /// world-writable path like `/tmp` is connectable by any local user
+    /// and carries the live microphone feed.
+    pub fn for_backend(backend: &str, socket_dir: &std::path::Path) -> Self {
         let dir = PathBuf::from("workers").join(backend_dir(backend));
         Self {
             python: dir.join(".venv/bin/python"),
             script: dir.join("worker.py"),
-            socket_path: PathBuf::from("/tmp/marceline-stt.sock"),
+            socket_path: socket_dir.join("stt.sock"),
         }
     }
 }
@@ -230,7 +235,15 @@ impl SttManager {
 
         let current = supervised.spec.borrow().clone();
         let paths = match backend {
-            Some(backend) => SttWorkerPaths::for_backend(backend),
+            Some(backend) => {
+                let socket_dir = supervised
+                    .paths
+                    .socket_path
+                    .parent()
+                    .expect("socket_path always has a parent directory")
+                    .to_path_buf();
+                SttWorkerPaths::for_backend(backend, &socket_dir)
+            }
             None => supervised.paths.clone(),
         };
 
@@ -368,15 +381,16 @@ mod tests {
 
     #[test]
     fn whisper_backend_maps_to_the_default_worker_directory() {
-        let paths = SttWorkerPaths::for_backend("whisper");
+        let paths = SttWorkerPaths::for_backend("whisper", &PathBuf::from("/run/marceline"));
         assert_eq!(paths.script, PathBuf::from("workers/stt/worker.py"));
         assert_eq!(paths.python, PathBuf::from("workers/stt/.venv/bin/python"));
+        assert_eq!(paths.socket_path, PathBuf::from("/run/marceline/stt.sock"));
     }
 
     #[test]
     fn an_unknown_backend_uses_its_own_directory_name() {
         // Adding a worker directory is enough to add a backend.
-        let paths = SttWorkerPaths::for_backend("faster-whisper");
+        let paths = SttWorkerPaths::for_backend("faster-whisper", &PathBuf::from("/run/marceline"));
         assert_eq!(
             paths.script,
             PathBuf::from("workers/faster-whisper/worker.py")
@@ -392,7 +406,10 @@ mod tests {
             lang: "en".to_string(),
             guard: Default::default(),
         };
-        let spec = worker_spec(&config, &SttWorkerPaths::for_backend(&config.backend));
+        let spec = worker_spec(
+            &config,
+            &SttWorkerPaths::for_backend(&config.backend, &PathBuf::from("/run/marceline")),
+        );
 
         assert_eq!(spec.name, WORKER_NAME);
         assert_eq!(spec.model_id, "large-v3");
