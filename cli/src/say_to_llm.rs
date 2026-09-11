@@ -30,6 +30,9 @@ pub enum SayToLlmError {
     /// contract.
     #[error(transparent)]
     Engine(#[from] marceline_core::EngineError),
+    /// The `read_file`/`list_dir` sandbox root could not be resolved.
+    #[error("failed to resolve the tool sandbox root: {0}")]
+    ToolSandboxRoot(#[from] std::io::Error),
 }
 
 /// Reads `[llm]` from `config_path`, compiles the system prompt from
@@ -65,8 +68,20 @@ pub async fn say_to_llm(
     // to know which is which.
     let mut broker = ToolBroker::new();
     broker.register(Arc::new(GetTimeTool)).expect("get_time is the first registration");
-    broker.register(Arc::new(ReadFileTool)).expect("read_file is the first registration");
-    broker.register(Arc::new(ListDirTool)).expect("list_dir is the first registration");
+    let tool_sandbox_root = match std::env::var_os("MARCELINE_TOOLS_ROOT") {
+        Some(dir) => PathBuf::from(dir),
+        None => std::env::current_dir()?,
+    };
+    broker
+        .register(Arc::new(ReadFileTool::new(marceline_core::tools::sandbox::Sandbox::new(
+            &tool_sandbox_root,
+        )?)))
+        .expect("read_file is the first registration");
+    broker
+        .register(Arc::new(ListDirTool::new(marceline_core::tools::sandbox::Sandbox::new(
+            &tool_sandbox_root,
+        )?)))
+        .expect("list_dir is the first registration");
     broker
         .register(Arc::new(WebSearchTool::new()?))
         .expect("web_search is the first registration");

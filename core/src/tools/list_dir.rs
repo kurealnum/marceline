@@ -5,10 +5,22 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use super::sandbox::Sandbox;
 use super::{SafetyClass, Tool, ToolResult};
 
-/// Lists the entries of a directory.
-pub struct ListDirTool;
+/// Lists the entries of a directory, confined to a configured root (see
+/// [`Sandbox`]) — same reach concern as [`super::read_file::ReadFileTool`]:
+/// this is auto-run by policy, so what it can enumerate has to be bounded.
+pub struct ListDirTool {
+    sandbox: Sandbox,
+}
+
+impl ListDirTool {
+    /// Confines every `list_dir` call to `root`.
+    pub fn new(sandbox: Sandbox) -> Self {
+        Self { sandbox }
+    }
+}
 
 #[async_trait]
 impl Tool for ListDirTool {
@@ -17,7 +29,8 @@ impl Tool for ListDirTool {
     }
 
     fn description(&self) -> &str {
-        "Lists the names and types (file/directory) of a directory's entries."
+        "Lists the names and types (file/directory) of a directory's entries. \
+         The path must be relative to, and stay inside, the configured sandbox root."
     }
 
     fn parameters(&self) -> Value {
@@ -26,7 +39,7 @@ impl Tool for ListDirTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Filesystem path of the directory to list.",
+                    "description": "Path of the directory to list, relative to the sandbox root.",
                 },
             },
             "required": ["path"],
@@ -38,10 +51,15 @@ impl Tool for ListDirTool {
             return ToolResult::Err("missing required argument: path".to_string());
         };
 
+        let resolved = match self.sandbox.resolve(path) {
+            Ok(resolved) => resolved,
+            Err(err) => return ToolResult::Err(err),
+        };
+
         tokio::select! {
             biased;
             _ = cancel.cancelled() => ToolResult::Err("cancelled".to_string()),
-            result = list(path) => result,
+            result = list(path, resolved) => result,
         }
     }
 
@@ -55,9 +73,11 @@ impl Tool for ListDirTool {
     }
 }
 
-/// Reads every entry of `path` into a JSON array of `{name, is_dir}`.
-async fn list(path: &str) -> ToolResult {
-    let mut read_dir = match tokio::fs::read_dir(path).await {
+/// Reads every entry of `resolved` (the sandbox-checked real path) into a
+/// JSON array of `{name, is_dir}`; `path` is the model's original
+/// request, used only for error messages.
+async fn list(path: &str, resolved: std::path::PathBuf) -> ToolResult {
+    let mut read_dir = match tokio::fs::read_dir(resolved).await {
         Ok(read_dir) => read_dir,
         Err(err) => return ToolResult::Err(format!("failed to list {path}: {err}")),
     };
@@ -84,18 +104,19 @@ async fn list(path: &str) -> ToolResult {
 mod tests {
     use super::*;
 
+    fn tool_in(dir: &std::path::Path) -> ListDirTool {
+        ListDirTool::new(Sandbox::new(dir).expect("root exists"))
+    }
+
     #[tokio::test]
     async fn lists_files_and_subdirectories() {
         let dir = tempfile::tempdir().expect("create temp dir");
         std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
         std::fs::create_dir(dir.path().join("sub")).unwrap();
 
-        let tool = ListDirTool;
+        let tool = tool_in(dir.path());
         let result = tool
-            .call(
-                serde_json::json!({"path": dir.path().to_str().unwrap()}),
-                CancellationToken::new(),
-            )
+            .call(serde_json::json!({"path": "."}), CancellationToken::new())
             .await;
 
         let ToolResult::Ok(payload) = result else {
@@ -123,13 +144,10 @@ mod tests {
     #[tokio::test]
     async fn an_empty_directory_reports_no_entries() {
         let dir = tempfile::tempdir().expect("create temp dir");
-        let tool = ListDirTool;
+        let tool = tool_in(dir.path());
 
         let result = tool
-            .call(
-                serde_json::json!({"path": dir.path().to_str().unwrap()}),
-                CancellationToken::new(),
-            )
+            .call(serde_json::json!({"path": "."}), CancellationToken::new())
             .await;
 
         assert_eq!(result, ToolResult::Ok(serde_json::json!({"entries": []})));
@@ -137,12 +155,22 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_path_is_a_structured_error_not_a_panic() {
-        let tool = ListDirTool;
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let tool = tool_in(dir.path());
         let result = tool
-            .call(
-                serde_json::json!({"path": "/definitely/does/not/exist"}),
-                CancellationToken::new(),
-            )
+            .call(serde_json::json!({"path": "does-not-exist"}), CancellationToken::new())
+            .await;
+
+        assert!(matches!(result, ToolResult::Err(_)));
+    }
+
+    #[tokio::test]
+    async fn a_path_outside_the_sandbox_root_is_refused() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let tool = tool_in(dir.path());
+
+        let result = tool
+            .call(serde_json::json!({"path": ".."}), CancellationToken::new())
             .await;
 
         assert!(matches!(result, ToolResult::Err(_)));
@@ -150,7 +178,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_path_argument_is_rejected() {
-        let tool = ListDirTool;
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let tool = tool_in(dir.path());
         let result = tool.call(serde_json::json!({}), CancellationToken::new()).await;
         assert_eq!(
             result,
@@ -161,15 +190,12 @@ mod tests {
     #[tokio::test]
     async fn an_already_cancelled_token_short_circuits() {
         let dir = tempfile::tempdir().expect("create temp dir");
-        let tool = ListDirTool;
+        let tool = tool_in(dir.path());
         let cancel = CancellationToken::new();
         cancel.cancel();
 
         let result = tool
-            .call(
-                serde_json::json!({"path": dir.path().to_str().unwrap()}),
-                cancel,
-            )
+            .call(serde_json::json!({"path": "."}), cancel)
             .await;
 
         assert_eq!(result, ToolResult::Err("cancelled".to_string()));

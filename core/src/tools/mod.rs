@@ -24,6 +24,7 @@
 pub mod get_time;
 pub mod list_dir;
 pub mod read_file;
+pub mod sandbox;
 pub mod web_search;
 
 use std::collections::HashMap;

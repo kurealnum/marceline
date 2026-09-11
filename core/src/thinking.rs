@@ -280,18 +280,41 @@ where
     }
 }
 
+/// Largest a rendered tool result is allowed to be before it's truncated.
+/// This is the backstop for *every* tool's result (an MCP server's, not
+/// just `read_file`'s own cap) — the message list this feeds grows across
+/// a turn and gets cloned on every subsequent iteration
+/// ([`collect_round`]'s callers), so one oversized result multiplies.
+const MAX_TOOL_RESULT_CHARS: usize = 64 * 1024;
+
 /// Renders a [`ToolResult`] as the text content of a `Role::Tool` message.
 ///
 /// Both variants become a JSON string: `Ok` because the model expects a
 /// JSON-ish tool result body, `Err` wrapped in `{"error": ...}` rather
 /// than left as bare text, so the model can distinguish "the tool told me
 /// this" from "the tool failed and here's why" without guessing from
-/// prose.
+/// prose. The rendered string is capped at [`MAX_TOOL_RESULT_CHARS`],
+/// truncated with a note rather than silently cut, regardless of which
+/// tool produced it.
 fn tool_result_content(result: ToolResult) -> String {
-    match result {
+    let rendered = match result {
         ToolResult::Ok(value) => value.to_string(),
         ToolResult::Err(message) => serde_json::json!({ "error": message }).to_string(),
+    };
+
+    if rendered.len() <= MAX_TOOL_RESULT_CHARS {
+        return rendered;
     }
+    let mut cut = MAX_TOOL_RESULT_CHARS;
+    while !rendered.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!(
+        "{}... [truncated: tool result was {} bytes, capped at {}]",
+        &rendered[..cut],
+        rendered.len(),
+        MAX_TOOL_RESULT_CHARS
+    )
 }
 
 /// Drains one chat stream into its text, requested tool calls, and finish
@@ -400,5 +423,14 @@ mod tests {
     fn tool_result_content_wraps_err_so_it_is_distinguishable() {
         let content = tool_result_content(ToolResult::Err("file not found".to_string()));
         assert_eq!(content, r#"{"error":"file not found"}"#);
+    }
+
+    #[test]
+    fn an_oversized_tool_result_is_truncated_with_a_note() {
+        let huge = "a".repeat(MAX_TOOL_RESULT_CHARS * 2);
+        let content = tool_result_content(ToolResult::Ok(serde_json::json!({ "content": huge })));
+
+        assert!(content.len() < MAX_TOOL_RESULT_CHARS * 2);
+        assert!(content.contains("truncated"));
     }
 }
