@@ -176,6 +176,52 @@ async fn tool_call_chunks_interleave_delta_and_done_events() {
 }
 
 #[tokio::test]
+async fn two_parallel_tool_calls_in_one_delta_are_both_emitted() {
+    let chunks = vec![
+        (
+            Duration::ZERO,
+            sse_line(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_weather","arguments":"{}"}},{"index":1,"id":"call_2","function":{"name":"get_time","arguments":"{}"}}]},"finish_reason":null}]}"#,
+            ),
+        ),
+        (Duration::ZERO, sse_line(r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#)),
+    ];
+    let base_url = start_fake_server(chunks).await;
+    let config = test_config(base_url);
+    let engine = OpenAiCompatibleEngine::new(&config, CancellationToken::new()).expect("engine");
+
+    let events: Vec<_> = engine
+        .chat(user_request("weather and time in nyc"))
+        .await
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(|item| item.expect("no stream error"))
+        .collect();
+
+    assert_eq!(
+        events,
+        vec![
+            ChatEvent::ToolCallDelta {
+                id: "call_1".to_string(),
+                name: Some("get_weather".to_string()),
+                args_delta: "{}".to_string(),
+            },
+            ChatEvent::ToolCallDelta {
+                id: "call_2".to_string(),
+                name: Some("get_time".to_string()),
+                args_delta: "{}".to_string(),
+            },
+            ChatEvent::ToolCallDone { id: "call_1".to_string() },
+            ChatEvent::ToolCallDone { id: "call_2".to_string() },
+            ChatEvent::Done {
+                finish_reason: FinishReason::ToolCalls,
+            },
+        ]
+    );
+}
+
+#[tokio::test]
 async fn cancellation_ends_the_stream_without_a_worker_error() {
     let chunks = vec![
         (Duration::ZERO, sse_line(r#"{"choices":[{"delta":{"content":"Hel"},"finish_reason":null}]}"#)),
