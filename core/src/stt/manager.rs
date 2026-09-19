@@ -327,13 +327,22 @@ async fn connect_when_ready(
     let mut previous = None;
 
     while tokio::time::Instant::now() < deadline {
-        let state = health.read().await.get(WORKER_NAME).copied();
+        let state = health.read().await.get(WORKER_NAME).cloned();
+
+        if let Some(WorkerState::Failed { reason }) = &state {
+            return Err(EngineError::Worker {
+                backend: BACKEND,
+                message: reason.clone(),
+            });
+        }
 
         // A worker that keeps dying is not going to become ready by being
         // waited on longer. Failing after a few cycles turns a silent
         // multi-minute stall into an error the user can act on — usually a
         // missing venv or a bad model id.
-        if state == Some(WorkerState::Restarting) && previous != Some(WorkerState::Restarting) {
+        if matches!(state.as_ref(), Some(WorkerState::Restarting))
+            && !matches!(previous.as_ref(), Some(WorkerState::Restarting))
+        {
             restarts += 1;
             if restarts > MAX_LAUNCH_ATTEMPTS {
                 return Err(last_err.unwrap_or(EngineError::Worker {
@@ -345,9 +354,9 @@ async fn connect_when_ready(
                 }));
             }
         }
-        previous = state;
+        previous = state.clone();
 
-        if state == Some(WorkerState::Up) {
+        if matches!(state.as_ref(), Some(WorkerState::Up)) {
             match GrpcSttEngine::connect(socket_path, cancel.clone()).await {
                 Ok(engine) => return Ok(engine),
                 Err(err) => last_err = Some(err),

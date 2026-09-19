@@ -28,6 +28,8 @@ const MAX_BACKOFF: Duration = Duration::from_secs(10);
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Maximum time to wait for a freshly spawned worker to report healthy.
 const HEALTH_POLL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Consecutive failed launches tolerated before the supervisor gives up.
+const MAX_CONSECUTIVE_LAUNCH_FAILURES: u32 = 20;
 
 /// Static, launch-time description of one worker process, following the
 /// standard CLI convention from the worker template (EPIC 0.4).
@@ -66,14 +68,24 @@ impl WorkerSpec {
 }
 
 /// Liveness of one supervised worker, as seen by other components.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerState {
     /// Process launched, not yet confirmed healthy.
     Starting,
     /// Process is running and its health RPC reports `SERVING`.
     Up,
+    /// Process was running but did not report healthy before the deadline.
+    Unhealthy {
+        /// The last reason the worker failed to become healthy.
+        reason: String,
+    },
     /// Process exited; a restart is pending (backoff).
     Restarting,
+    /// The supervisor stopped retrying after repeated launch failures.
+    Failed {
+        /// The last failure that caused the supervisor to give up.
+        reason: String,
+    },
     /// Supervisor is shutting down; the worker will not be restarted.
     Stopped,
 }
@@ -99,6 +111,9 @@ pub struct Supervisor {
     _spec_owner: Option<watch::Sender<WorkerSpec>>,
     health: HealthView,
     shutdown: watch::Receiver<bool>,
+    health_poll_interval: Duration,
+    health_poll_timeout: Duration,
+    max_consecutive_launch_failures: u32,
 }
 
 impl Supervisor {
@@ -112,12 +127,15 @@ impl Supervisor {
         health: HealthView,
         shutdown: watch::Receiver<bool>,
     ) -> Self {
-        Self {
+        Self::with_options(
             spec,
-            _spec_owner: None,
+            None,
             health,
             shutdown,
-        }
+            HEALTH_POLL_INTERVAL,
+            HEALTH_POLL_TIMEOUT,
+            MAX_CONSECUTIVE_LAUNCH_FAILURES,
+        )
     }
 
     /// Creates a supervisor for a worker whose spec never changes.
@@ -127,12 +145,55 @@ impl Supervisor {
     /// the process's life.
     pub fn fixed(spec: WorkerSpec, health: HealthView, shutdown: watch::Receiver<bool>) -> Self {
         let (tx, rx) = watch::channel(spec);
-        Self {
-            spec: rx,
-            _spec_owner: Some(tx),
+        Self::with_options(
+            rx,
+            Some(tx),
             health,
             shutdown,
+            HEALTH_POLL_INTERVAL,
+            HEALTH_POLL_TIMEOUT,
+            MAX_CONSECUTIVE_LAUNCH_FAILURES,
+        )
+    }
+
+    fn with_options(
+        spec: watch::Receiver<WorkerSpec>,
+        spec_owner: Option<watch::Sender<WorkerSpec>>,
+        health: HealthView,
+        shutdown: watch::Receiver<bool>,
+        health_poll_interval: Duration,
+        health_poll_timeout: Duration,
+        max_consecutive_launch_failures: u32,
+    ) -> Self {
+        Self {
+            spec,
+            _spec_owner: spec_owner,
+            health,
+            shutdown,
+            health_poll_interval,
+            health_poll_timeout,
+            max_consecutive_launch_failures: max_consecutive_launch_failures.max(1),
         }
+    }
+
+    #[cfg(test)]
+    fn with_test_options(
+        spec: watch::Receiver<WorkerSpec>,
+        health: HealthView,
+        shutdown: watch::Receiver<bool>,
+        health_poll_interval: Duration,
+        health_poll_timeout: Duration,
+        max_consecutive_launch_failures: u32,
+    ) -> Self {
+        Self::with_options(
+            spec,
+            None,
+            health,
+            shutdown,
+            health_poll_interval,
+            health_poll_timeout,
+            max_consecutive_launch_failures,
+        )
     }
 
     /// Runs the supervise loop until shutdown is signaled. Intended to be
@@ -140,6 +201,7 @@ impl Supervisor {
     pub async fn run(mut self) {
         let mut backoff = INITIAL_BACKOFF;
         let mut first_launch = true;
+        let mut consecutive_launch_failures = 0;
         // Set once every spec sender is gone: the worker can no longer be
         // reconfigured, but must still be supervised and still stop on
         // shutdown.
@@ -147,7 +209,8 @@ impl Supervisor {
 
         loop {
             if *self.shutdown.borrow() {
-                self.set_state(WorkerState::Stopped).await;
+                let name = self.spec.borrow().name.clone();
+                self.set_state(&name, WorkerState::Stopped).await;
                 return;
             }
 
@@ -157,32 +220,75 @@ impl Supervisor {
             let spec = self.spec.borrow_and_update().clone();
             let name = spec.name.clone();
 
-            self.set_state(WorkerState::Starting).await;
+            self.set_state(&name, WorkerState::Starting).await;
             tracing::info!(worker = %name, model_id = %spec.model_id, "spawning worker");
 
             let mut child = match spec.command().spawn() {
                 Ok(child) => child,
                 Err(err) => {
-                    tracing::error!(worker = %name, %err, "failed to spawn worker");
+                    let reason = format!("failed to spawn worker: {err}");
+                    tracing::warn!(worker = %name, reason = %reason, "worker launch failed");
+                    if self
+                        .record_launch_failure(
+                            &name,
+                            &mut consecutive_launch_failures,
+                            reason,
+                        )
+                        .await
+                    {
+                        return;
+                    }
                     if self.wait_backoff_or_shutdown(&mut backoff).await {
-                        self.set_state(WorkerState::Stopped).await;
+                        self.set_state(&name, WorkerState::Stopped).await;
                         return;
                     }
                     continue;
                 }
             };
 
-            if self.wait_healthy(&spec).await {
-                if first_launch {
-                    tracing::info!(worker = %name, model_id = %spec.model_id, "worker up");
-                } else {
-                    tracing::info!(worker = %name, model_id = %spec.model_id, "worker restarted");
+            match self.wait_healthy(&spec).await {
+                Ok(()) => {
+                    if first_launch {
+                        tracing::info!(worker = %name, model_id = %spec.model_id, "worker up");
+                    } else {
+                        tracing::info!(worker = %name, model_id = %spec.model_id, "worker restarted");
+                    }
+                    first_launch = false;
+                    self.set_state(&name, WorkerState::Up).await;
+                    backoff = INITIAL_BACKOFF;
+                    consecutive_launch_failures = 0;
                 }
-                first_launch = false;
-                self.set_state(WorkerState::Up).await;
-                backoff = INITIAL_BACKOFF;
-            } else {
-                tracing::warn!(worker = %name, "worker never became healthy");
+                Err(reason) => {
+                    self.set_state(
+                        &name,
+                        WorkerState::Unhealthy {
+                            reason: reason.clone(),
+                        },
+                    )
+                    .await;
+                    tracing::warn!(
+                        worker = %name,
+                        reason = %reason,
+                        "worker never became healthy; killing worker"
+                    );
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    if self
+                        .record_launch_failure(
+                            &name,
+                            &mut consecutive_launch_failures,
+                            reason,
+                        )
+                        .await
+                    {
+                        return;
+                    }
+                    if self.wait_backoff_or_shutdown(&mut backoff).await {
+                        self.set_state(&name, WorkerState::Stopped).await;
+                        return;
+                    }
+                    continue;
+                }
             }
 
             // A spec change is a deliberate restart, so it skips the
@@ -209,7 +315,7 @@ impl Supervisor {
                         if *self.shutdown.borrow() {
                             tracing::info!(worker = %name, "shutting down worker");
                             let _ = child.kill().await;
-                            self.set_state(WorkerState::Stopped).await;
+                            self.set_state(&name, WorkerState::Stopped).await;
                             return;
                         }
                         spec_just_closed = false;
@@ -227,7 +333,7 @@ impl Supervisor {
                                 to_model = %next.model_id,
                                 "spec changed, restarting worker"
                             );
-                            self.set_state(WorkerState::Restarting).await;
+                            self.set_state(&name, WorkerState::Restarting).await;
                             // SIGKILL via `kill` is blunt, but the worker
                             // holds no state worth draining and the swap
                             // caller has already waited for in-flight work.
@@ -244,7 +350,7 @@ impl Supervisor {
             }
 
             if *self.shutdown.borrow() {
-                self.set_state(WorkerState::Stopped).await;
+                self.set_state(&name, WorkerState::Stopped).await;
                 return;
             }
 
@@ -254,9 +360,9 @@ impl Supervisor {
             }
 
             tracing::info!(worker = %name, backoff_ms = backoff.as_millis() as u64, "worker restarting");
-            self.set_state(WorkerState::Restarting).await;
+            self.set_state(&name, WorkerState::Restarting).await;
             if self.wait_backoff_or_shutdown(&mut backoff).await {
-                self.set_state(WorkerState::Stopped).await;
+                self.set_state(&name, WorkerState::Stopped).await;
                 return;
             }
         }
@@ -274,15 +380,42 @@ impl Supervisor {
         *self.shutdown.borrow()
     }
 
-    async fn set_state(&self, state: WorkerState) {
-        let name = self.spec.borrow().name.clone();
-        self.health.write().await.insert(name, state);
+    async fn set_state(&self, name: &str, state: WorkerState) {
+        self.health
+            .write()
+            .await
+            .insert(name.to_string(), state);
+    }
+
+    async fn record_launch_failure(
+        &self,
+        name: &str,
+        consecutive_failures: &mut u32,
+        reason: String,
+    ) -> bool {
+        *consecutive_failures += 1;
+        if *consecutive_failures >= self.max_consecutive_launch_failures {
+            let reason = format!(
+                "{reason} (after {consecutive_failures} consecutive launch failures)"
+            );
+            tracing::error!(
+                worker = %name,
+                attempts = *consecutive_failures,
+                reason = %reason,
+                "worker launch failed repeatedly; giving up"
+            );
+            self.set_state(name, WorkerState::Failed { reason }).await;
+            true
+        } else {
+            self.set_state(name, WorkerState::Restarting).await;
+            false
+        }
     }
 
     /// Polls the worker's standard gRPC health-check RPC (over its UDS)
     /// until it reports `SERVING` or [`HEALTH_POLL_TIMEOUT`] elapses.
-    async fn wait_healthy(&self, spec: &WorkerSpec) -> bool {
-        let deadline = tokio::time::Instant::now() + HEALTH_POLL_TIMEOUT;
+    async fn wait_healthy(&self, spec: &WorkerSpec) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + self.health_poll_timeout;
         while tokio::time::Instant::now() < deadline {
             if let Ok(mut client) = connect_health_client(&spec.socket_path).await {
                 if let Ok(resp) = client
@@ -292,13 +425,16 @@ impl Supervisor {
                     .await
                 {
                     if resp.into_inner().status == ServingStatus::Serving as i32 {
-                        return true;
+                        return Ok(());
                     }
                 }
             }
-            sleep(HEALTH_POLL_INTERVAL).await;
+            sleep(self.health_poll_interval).await;
         }
-        false
+        Err(format!(
+            "worker did not report SERVING within {}ms",
+            self.health_poll_timeout.as_millis()
+        ))
     }
 }
 
@@ -320,4 +456,86 @@ async fn connect_health_client(
     socket_path: &Path,
 ) -> Result<HealthClient<Channel>, tonic::transport::Error> {
     Ok(HealthClient::new(crate::ipc::connect_uds(socket_path).await?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use tokio::sync::{watch, RwLock};
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unhealthy_worker_is_killed_and_terminal_failure_keeps_reason() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pid_path = dir.path().join("worker.pid");
+        let script_path = dir.path().join("stuck-worker.sh");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\nexec sleep 60\n",
+                pid_path.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions).unwrap();
+
+        let spec = WorkerSpec {
+            name: "stuck".to_string(),
+            python: PathBuf::from("/bin/sh"),
+            script: script_path,
+            socket_path: dir.path().join("worker.sock"),
+            model_id: "test".to_string(),
+            device: Device::Cpu,
+        };
+        let health: HealthView = Arc::new(RwLock::new(HashMap::new()));
+        let (_spec_tx, spec_rx) = watch::channel(spec);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let supervisor = Supervisor::with_test_options(
+            spec_rx,
+            Arc::clone(&health),
+            shutdown_rx,
+            Duration::from_millis(1),
+            Duration::from_millis(20),
+            2,
+        );
+        let task = tokio::spawn(supervisor.run());
+
+        let state = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(state) = health.read().await.get("stuck").cloned() {
+                    if matches!(state, WorkerState::Failed { .. }) {
+                        break state;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("supervisor should reach its terminal failure state");
+        task.await.unwrap();
+
+        let WorkerState::Failed { reason } = state else {
+            panic!("expected terminal failure, got {state:?}");
+        };
+        assert!(reason.contains("did not report SERVING"), "reason: {reason}");
+
+        let pid = std::fs::read_to_string(pid_path)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        let alive = std::process::Command::new("/bin/sh")
+            .args(["-c", "kill -0 \"$1\"", "kill-check", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "unhealthy worker process {pid} is still alive");
+    }
 }
