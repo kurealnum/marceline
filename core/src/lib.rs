@@ -41,15 +41,14 @@ pub use daemon::{
     WireConversationState,
 };
 pub use device::Device;
-pub use embedding::{EmbedError, EmbeddingPipeline, MiniLmEmbedder, MINILM_DIM};
+pub use embedding::{EmbedError, EmbeddingPipeline, MiniLmEmbedder, MINILM_DIM, MINILM_MAX_TOKENS};
 pub use engine::{AudioStream, EngineError};
 pub use gate::{Gate, GateOutput, GateState};
 pub use history::{HistoryError, HistoryStore, MemoryRecord, NewMemory, NewTurn, TurnRecord};
 pub use llm::{
     compile_system_prompt, ChatEvent, ChatEventStream, ChatRequest, DropOldestTurn, FinishReason,
     LlmEngine, LlmInfo, MemoryEntry, Message, OpenAiCompatibleEngine, Role, SessionGuard,
-    SessionGuardState,
-    ToolCallRequest, ToolSpec, TrimPolicy, Trust, TurnBuffer,
+    SessionGuardState, ToolCallRequest, ToolSpec, TrimPolicy, Trust, TurnBuffer,
 };
 pub use mcp::{register_mcp_tools, McpCallOutcome, McpClient, McpError, McpTool, McpToolInfo};
 pub use memory::{
