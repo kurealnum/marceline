@@ -64,7 +64,13 @@ def handle(request: dict) -> None:
 
 
 def main() -> None:
-    if "--exit-immediately" in sys.argv[1:]:
+    args = sys.argv[1:]
+    if "--stderr-message" in args:
+        index = args.index("--stderr-message")
+        message = args[index + 1] if index + 1 < len(args) else "fake stderr message"
+        print(message, file=sys.stderr, flush=True)
+
+    if "--exit-immediately" in args:
         return
 
     for line in sys.stdin:
