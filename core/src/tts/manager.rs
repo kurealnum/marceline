@@ -143,9 +143,18 @@ async fn connect_when_ready(
     let mut previous = None;
 
     while tokio::time::Instant::now() < deadline {
-        let state = health.read().await.get(WORKER_NAME).copied();
+        let state = health.read().await.get(WORKER_NAME).cloned();
 
-        if state == Some(WorkerState::Restarting) && previous != Some(WorkerState::Restarting) {
+        if let Some(WorkerState::Failed { reason }) = &state {
+            return Err(EngineError::Worker {
+                backend: BACKEND,
+                message: reason.clone(),
+            });
+        }
+
+        if matches!(state.as_ref(), Some(WorkerState::Restarting))
+            && !matches!(previous.as_ref(), Some(WorkerState::Restarting))
+        {
             restarts += 1;
             if restarts > MAX_LAUNCH_ATTEMPTS {
                 return Err(last_err.unwrap_or(EngineError::Worker {
@@ -157,9 +166,9 @@ async fn connect_when_ready(
                 }));
             }
         }
-        previous = state;
+        previous = state.clone();
 
-        if state == Some(WorkerState::Up) {
+        if matches!(state.as_ref(), Some(WorkerState::Up)) {
             match GrpcTtsEngine::connect(socket_path, cancel.clone()).await {
                 Ok(engine) => return Ok(engine),
                 Err(err) => last_err = Some(err),

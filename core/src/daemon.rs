@@ -91,14 +91,24 @@ pub enum ControlRequest {
 /// serializable mirror of [`WorkerState`], which lives in `core::supervisor`
 /// for the in-process health view and has no reason to derive `serde`
 /// itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StageHealth {
     /// Process launched, not yet confirmed healthy.
     Starting,
     /// Process is running and healthy.
     Up,
+    /// Process was running but did not report healthy before the deadline.
+    Unhealthy {
+        /// The last reason the worker failed to become healthy.
+        reason: String,
+    },
     /// Process exited; a restart is pending.
     Restarting,
+    /// Supervisor stopped retrying after repeated launch failures.
+    Failed {
+        /// The last failure that caused the supervisor to give up.
+        reason: String,
+    },
     /// Supervisor is shutting down; the worker will not be restarted.
     Stopped,
 }
@@ -108,9 +118,17 @@ impl From<WorkerState> for StageHealth {
         match state {
             WorkerState::Starting => StageHealth::Starting,
             WorkerState::Up => StageHealth::Up,
+            WorkerState::Unhealthy { reason } => StageHealth::Unhealthy { reason },
             WorkerState::Restarting => StageHealth::Restarting,
+            WorkerState::Failed { reason } => StageHealth::Failed { reason },
             WorkerState::Stopped => StageHealth::Stopped,
         }
+    }
+}
+
+impl From<&WorkerState> for StageHealth {
+    fn from(state: &WorkerState) -> Self {
+        StageHealth::from(state.clone())
     }
 }
 
@@ -278,14 +296,14 @@ pub async fn serve_control(
                         .read()
                         .await
                         .iter()
-                        .map(|(name, s)| (name.clone(), StageHealth::from(*s)))
+                        .map(|(name, s)| (name.clone(), StageHealth::from(s)))
                         .collect();
                     workers.extend(
                         tts_health
                             .read()
                             .await
                             .iter()
-                            .map(|(name, s)| (name.clone(), StageHealth::from(*s))),
+                            .map(|(name, s)| (name.clone(), StageHealth::from(s))),
                     );
                     ControlResponse::Status(StatusReport {
                         workers,
@@ -375,6 +393,20 @@ mod tests {
         assert!(report
             .workers
             .contains(&("tts".to_string(), StageHealth::Restarting)));
+    }
+
+    #[test]
+    fn stage_health_preserves_terminal_worker_failure_reason() {
+        let state = WorkerState::Failed {
+            reason: "model failed to load".to_string(),
+        };
+
+        assert_eq!(
+            StageHealth::from(&state),
+            StageHealth::Failed {
+                reason: "model failed to load".to_string(),
+            }
+        );
     }
 
     #[tokio::test]
