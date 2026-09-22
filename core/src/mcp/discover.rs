@@ -23,29 +23,50 @@ use crate::tools::ToolBroker;
 /// test) can observe what didn't come up without depending on captured
 /// log output — the actual reason is still logged via `tracing::warn` at
 /// the point of failure.
-pub async fn register_mcp_tools(broker: &mut ToolBroker, servers: &[McpServerConfig]) -> Vec<String> {
+pub async fn register_mcp_tools(
+    broker: &mut ToolBroker,
+    servers: &[McpServerConfig],
+) -> Vec<String> {
     let mut skipped = Vec::new();
     for server in servers {
-        if let Err(err) = register_one(broker, server).await {
-            tracing::warn!(server = %server.name, %err, "skipping mcp server");
-            skipped.push(server.name.clone());
+        match register_one(broker, server).await {
+            Ok(collisions) => {
+                for (tool, err) in collisions {
+                    tracing::warn!(
+                        server = %server.name,
+                        tool = %tool,
+                        error = %err,
+                        "mcp tool name collision; tool not registered"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(server = %server.name, error = %err, "mcp server unavailable");
+                skipped.push(server.name.clone());
+            }
         }
     }
     skipped
 }
 
 /// Connects, initializes, discovers, and registers tools for one server.
-async fn register_one(broker: &mut ToolBroker, server: &McpServerConfig) -> Result<(), McpError> {
+async fn register_one(
+    broker: &mut ToolBroker,
+    server: &McpServerConfig,
+) -> Result<Vec<(String, String)>, McpError> {
     let transport: Box<dyn McpTransport> = match &server.transport {
         McpTransportConfig::Stdio { command, args } => {
             Box::new(StdioTransport::spawn(server.name.clone(), command, args).await?)
         }
-        McpTransportConfig::Http { url } => Box::new(HttpTransport::new(server.name.clone(), url.clone())?),
+        McpTransportConfig::Http { url } => {
+            Box::new(HttpTransport::new(server.name.clone(), url.clone())?)
+        }
     };
 
     let client = Arc::new(McpClient::new(server.name.clone(), transport));
     client.initialize().await?;
     let tools = client.list_tools().await?;
+    let mut collisions = Vec::new();
 
     for tool in tools {
         let namespaced = format!("{}.{}", server.name, tool.name);
@@ -57,13 +78,11 @@ async fn register_one(broker: &mut ToolBroker, server: &McpServerConfig) -> Resu
             Arc::clone(&client),
         ));
         if let Err(err) = broker.register(mcp_tool) {
-            // A name collision (two servers whose namespace prefixes
-            // still collided, or a built-in reusing an MCP server's
-            // name) is this one tool's problem, not the whole server's —
-            // the rest of the server's tools still register.
-            tracing::warn!(tool = %namespaced, %err, "skipping duplicate mcp tool name");
+            // A collision is this one tool's problem, not the whole
+            // server's — the rest of the server's tools still register.
+            collisions.push((namespaced, err.to_string()));
         }
     }
 
-    Ok(())
+    Ok(collisions)
 }

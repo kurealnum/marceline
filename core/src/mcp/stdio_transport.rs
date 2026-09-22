@@ -11,21 +11,25 @@
 //! call is waiting on.
 
 use std::collections::HashMap;
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::{oneshot, Mutex};
+use tokio::task::JoinHandle;
 
 use super::transport::{McpError, McpTransport};
 use super::wire::WireResponse;
 
 /// Requests awaiting a response, keyed by the id they were sent with.
 type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, McpError>>>>>;
+
+type ExitSummary = Arc<Mutex<Option<String>>>;
 
 /// A running MCP server reached over its stdin/stdout.
 ///
@@ -37,8 +41,16 @@ pub struct StdioTransport {
     stdin: Mutex<ChildStdin>,
     next_id: AtomicU64,
     pending: PendingMap,
-    // Kept alive only to hold the kill-on-drop process handle; never read.
-    _child: Child,
+    // Owns the child indirectly so kill_on_drop remains active. The watcher
+    // also records the exit status for requests failed by stdout EOF.
+    child_watcher: JoinHandle<()>,
+}
+
+impl Drop for StdioTransport {
+    fn drop(&mut self) {
+        // Aborting the watcher drops its Child, which triggers kill_on_drop.
+        self.child_watcher.abort();
+    }
 }
 
 impl StdioTransport {
@@ -50,12 +62,16 @@ impl StdioTransport {
     /// fails individual [`request`][Self::request] calls instead, so a
     /// hung server does not block discovery forever without a caller
     /// choosing to wait that long.
-    pub async fn spawn(server_name: String, command: &str, args: &[String]) -> Result<Self, McpError> {
+    pub async fn spawn(
+        server_name: String,
+        command: &str,
+        args: &[String],
+    ) -> Result<Self, McpError> {
         let mut child = Command::new(command)
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .map_err(|err| McpError::Transport {
@@ -65,18 +81,41 @@ impl StdioTransport {
 
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
-        let pending: PendingMap =
-            Arc::new(Mutex::new(HashMap::new()));
+        let stderr = child.stderr.take().expect("piped stderr");
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let exit_summary: ExitSummary = Arc::new(Mutex::new(None));
 
-        spawn_reader(server_name.clone(), stdout, Arc::clone(&pending));
+        let child_exit_summary = Arc::clone(&exit_summary);
+        let child_watcher = tokio::spawn(async move {
+            let summary = match child.wait().await {
+                Ok(status) => format_exit_status(&status),
+                Err(err) => format!("failed to wait for server process: {err}"),
+            };
+            *child_exit_summary.lock().await = Some(summary);
+        });
+
+        spawn_reader(
+            server_name.clone(),
+            stdout,
+            Arc::clone(&pending),
+            Arc::clone(&exit_summary),
+        );
+        spawn_stderr_reader(server_name.clone(), stderr);
 
         Ok(Self {
             server_name,
             stdin: Mutex::new(stdin),
             next_id: AtomicU64::new(1),
             pending,
-            _child: child,
+            child_watcher,
         })
+    }
+}
+
+fn format_exit_status(status: &ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("exit status {code}"),
+        None => format!("signal termination ({status:?})"),
     }
 }
 
@@ -89,8 +128,9 @@ impl StdioTransport {
 /// error to whoever is waiting, not as a stuck future.
 fn spawn_reader(
     server_name: String,
-    stdout: tokio::process::ChildStdout,
+    stdout: ChildStdout,
     pending: PendingMap,
+    exit_summary: ExitSummary,
 ) {
     tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
@@ -103,17 +143,59 @@ fn spawn_reader(
                     dispatch_line(&server_name, &line, &pending).await;
                 }
                 Ok(None) => {
-                    fail_all_pending(&server_name, "server closed its stdout", &pending).await;
+                    let reason = stdout_closed_reason(&exit_summary).await;
+                    tracing::warn!(server = %server_name, reason = %reason, "mcp server stdout closed");
+                    fail_all_pending(&server_name, &reason, &pending).await;
                     return;
                 }
                 Err(err) => {
+                    let reason = match wait_for_exit_summary(&exit_summary).await {
+                        Some(status) => format!("failed to read server stdout: {err} ({status})"),
+                        None => format!("failed to read server stdout: {err}"),
+                    };
                     tracing::warn!(server = %server_name, %err, "failed to read mcp server stdout");
-                    fail_all_pending(&server_name, "failed to read server stdout", &pending).await;
+                    fail_all_pending(&server_name, &reason, &pending).await;
                     return;
                 }
             }
         }
     });
+}
+
+fn spawn_stderr_reader(server_name: String, stderr: ChildStderr) {
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) if !line.trim().is_empty() => {
+                    tracing::warn!(server = %server_name, line = %line, "mcp server stderr");
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => return,
+                Err(err) => {
+                    tracing::warn!(server = %server_name, %err, "failed to read mcp server stderr");
+                    return;
+                }
+            }
+        }
+    });
+}
+
+async fn wait_for_exit_summary(exit_summary: &ExitSummary) -> Option<String> {
+    for _ in 0..20 {
+        if let Some(summary) = exit_summary.lock().await.clone() {
+            return Some(summary);
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    None
+}
+
+async fn stdout_closed_reason(exit_summary: &ExitSummary) -> String {
+    match wait_for_exit_summary(exit_summary).await {
+        Some(status) => format!("server closed its stdout ({status})"),
+        None => "server closed its stdout before the process exited".to_string(),
+    }
 }
 
 /// Parses one line as a [`WireResponse`] and resolves the pending request
@@ -123,11 +205,7 @@ fn spawn_reader(
 /// up, or an id this client never sent) and a line that fails to parse at
 /// all are both logged and otherwise ignored — one bad line must not take
 /// down the reader task and every other in-flight call with it.
-async fn dispatch_line(
-    server_name: &str,
-    line: &str,
-    pending: &PendingMap,
-) {
+async fn dispatch_line(server_name: &str, line: &str, pending: &PendingMap) {
     let response: WireResponse = match serde_json::from_str(line) {
         Ok(response) => response,
         Err(err) => {
@@ -157,11 +235,7 @@ async fn dispatch_line(
 }
 
 /// Fails every request still waiting for a response with `reason`.
-async fn fail_all_pending(
-    server_name: &str,
-    reason: &str,
-    pending: &PendingMap,
-) {
+async fn fail_all_pending(server_name: &str, reason: &str, pending: &PendingMap) {
     for (_, sender) in pending.lock().await.drain() {
         let _ = sender.send(Err(McpError::Transport {
             server: server_name.to_string(),
@@ -214,20 +288,48 @@ impl McpTransport for StdioTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::sync::Mutex as StdMutex;
+
+    use tracing_subscriber::fmt::MakeWriter;
 
     fn fixture_path() -> String {
-        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake_mcp_stdio_server.py").to_string()
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_mcp_stdio_server.py"
+        )
+        .to_string()
+    }
+
+    #[derive(Clone)]
+    struct BufferWriter(Arc<StdMutex<Vec<u8>>>);
+
+    struct BufferGuard(Arc<StdMutex<Vec<u8>>>);
+
+    impl<'a> MakeWriter<'a> for BufferWriter {
+        type Writer = BufferGuard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            BufferGuard(Arc::clone(&self.0))
+        }
+    }
+
+    impl Write for BufferGuard {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     #[tokio::test]
     async fn a_request_reaches_the_server_and_its_response_comes_back() {
-        let transport = StdioTransport::spawn(
-            "fake".to_string(),
-            "python3",
-            &[fixture_path()],
-        )
-        .await
-        .expect("spawn fake server");
+        let transport = StdioTransport::spawn("fake".to_string(), "python3", &[fixture_path()])
+            .await
+            .expect("spawn fake server");
 
         let result = transport
             .request("initialize", serde_json::json!({}))
@@ -249,7 +351,10 @@ mod tests {
             let transport = Arc::clone(&transport);
             tokio::spawn(async move {
                 transport
-                    .request("tools/call", serde_json::json!({"name": "add", "arguments": {"a": 1, "b": 2}}))
+                    .request(
+                        "tools/call",
+                        serde_json::json!({"name": "add", "arguments": {"a": 1, "b": 2}}),
+                    )
                     .await
             })
         };
@@ -257,7 +362,10 @@ mod tests {
             let transport = Arc::clone(&transport);
             tokio::spawn(async move {
                 transport
-                    .request("tools/call", serde_json::json!({"name": "add", "arguments": {"a": 10, "b": 20}}))
+                    .request(
+                        "tools/call",
+                        serde_json::json!({"name": "add", "arguments": {"a": 10, "b": 20}}),
+                    )
                     .await
             })
         };
@@ -301,6 +409,47 @@ mod tests {
         .await
         .expect("request must not hang once the server has exited");
 
+        let Err(McpError::Transport { message, .. }) = result else {
+            panic!("expected transport error after server exit");
+        };
+        assert!(message.contains("exit status 0"), "message: {message}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stderr_lines_are_logged_with_the_server_name() {
+        let output = Arc::new(StdMutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(BufferWriter(Arc::clone(&output)))
+            .finish();
+
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("no other stdio transport test should install a subscriber");
+
+        let transport = StdioTransport::spawn(
+            "broken".to_string(),
+            "python3",
+            &[
+                fixture_path(),
+                "--stderr-message".to_string(),
+                "missing API key".to_string(),
+                "--exit-immediately".to_string(),
+            ],
+        )
+        .await
+        .expect("spawn fake server");
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            transport.request("initialize", serde_json::json!({})),
+        )
+        .await
+        .expect("request must finish after the server exits");
         assert!(result.is_err());
+
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("broken"), "logs: {logs}");
+        assert!(logs.contains("missing API key"), "logs: {logs}");
+        assert!(logs.contains("mcp server stderr"), "logs: {logs}");
     }
 }

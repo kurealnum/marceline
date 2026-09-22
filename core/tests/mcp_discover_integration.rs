@@ -8,7 +8,11 @@ use marceline_core::{register_mcp_tools, ToolBroker, ToolResult};
 use tokio_util::sync::CancellationToken;
 
 fn fixture_path() -> String {
-    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake_mcp_stdio_server.py").to_string()
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/fake_mcp_stdio_server.py"
+    )
+    .to_string()
 }
 
 fn working_server(name: &str) -> McpServerConfig {
@@ -87,5 +91,22 @@ async fn two_servers_namespace_their_tools_independently() {
     assert!(skipped.is_empty());
     let mut names: Vec<String> = broker.catalog().into_iter().map(|spec| spec.name).collect();
     names.sort();
-    assert_eq!(names, vec!["first.add".to_string(), "second.add".to_string()]);
+    assert_eq!(
+        names,
+        vec!["first.add".to_string(), "second.add".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn a_duplicate_tool_name_does_not_mark_the_server_unavailable() {
+    let mut broker = ToolBroker::new();
+    let skipped = register_mcp_tools(
+        &mut broker,
+        &[working_server("same"), working_server("same")],
+    )
+    .await;
+
+    assert!(skipped.is_empty());
+    assert_eq!(broker.len(), 1);
+    assert_eq!(broker.catalog()[0].name, "same.add");
 }
