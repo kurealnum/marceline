@@ -20,6 +20,7 @@ use std::path::Path;
 use ort::session::Session;
 use ort::value::Tensor;
 use tokenizers::Tokenizer;
+use tokenizers::tokenizer::TruncationParams;
 
 /// `all-MiniLM-L6-v2`'s sentence-embedding output width. Fixed for this
 /// model family; a different embedding model would need its own constant
@@ -27,6 +28,11 @@ use tokenizers::Tokenizer;
 /// why v1 hardcodes one dimension rather than making the vector index
 /// dimension-generic).
 pub const MINILM_DIM: usize = 384;
+
+/// `all-MiniLM-L6-v2`'s maximum input sequence length, including special
+/// tokens. This is a property of this model family, not a general tokenizer
+/// default.
+pub const MINILM_MAX_TOKENS: usize = 512;
 
 /// Errors from loading or running an embedding pipeline.
 #[derive(Debug, thiserror::Error)]
@@ -46,6 +52,9 @@ pub enum EmbedError {
     /// Tokenizing the input text failed.
     #[error("failed to tokenize text: {0}")]
     Tokenize(#[source] tokenizers::Error),
+    /// Configuring the tokenizer's model-specific limits failed.
+    #[error("failed to configure tokenizer: {0}")]
+    ConfigureTokenizer(#[source] tokenizers::Error),
     /// Running inference failed.
     #[error("embedding inference failed: {0}")]
     Inference(#[source] ort::Error),
@@ -90,6 +99,14 @@ pub struct MiniLmEmbedder {
     model_id: String,
 }
 
+fn configure_minilm_tokenizer(tokenizer: &mut Tokenizer) -> Result<(), tokenizers::Error> {
+    tokenizer.with_truncation(Some(TruncationParams {
+        max_length: MINILM_MAX_TOKENS,
+        ..Default::default()
+    }))?;
+    Ok(())
+}
+
 impl MiniLmEmbedder {
     /// Loads `model.onnx` and `tokenizer.json` from `model_dir`.
     ///
@@ -106,11 +123,12 @@ impl MiniLmEmbedder {
             .commit_from_file(model_dir.join("model.onnx"))
             .map_err(EmbedError::LoadModel)?;
         let tokenizer_path = model_dir.join("tokenizer.json");
-        let tokenizer =
+        let mut tokenizer =
             Tokenizer::from_file(&tokenizer_path).map_err(|source| EmbedError::LoadTokenizer {
                 path: tokenizer_path,
                 source,
             })?;
+        configure_minilm_tokenizer(&mut tokenizer).map_err(EmbedError::ConfigureTokenizer)?;
         Ok(Self {
             session,
             tokenizer,
@@ -125,6 +143,13 @@ impl EmbeddingPipeline for MiniLmEmbedder {
             .tokenizer
             .encode(text, true)
             .map_err(EmbedError::Tokenize)?;
+        if !encoding.get_overflowing().is_empty() {
+            tracing::warn!(
+                model_id = %self.model_id,
+                max_tokens = MINILM_MAX_TOKENS,
+                "embedding input exceeded the model token limit; truncating"
+            );
+        }
         let ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
         let mask: Vec<i64> = encoding
             .get_attention_mask()
@@ -191,6 +216,36 @@ impl EmbeddingPipeline for MiniLmEmbedder {
 
     fn model_id(&self) -> &str {
         &self.model_id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MINILM_MAX_TOKENS, configure_minilm_tokenizer};
+    use std::collections::HashMap;
+    use tokenizers::{
+        Tokenizer, models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace,
+    };
+
+    #[test]
+    fn minilm_tokenizer_truncates_sequences_to_model_limit() {
+        let tokenizer_model = WordLevel::builder()
+            .vocab(HashMap::from([("<unk>".to_string(), 0)]))
+            .build()
+            .unwrap();
+        let mut tokenizer = Tokenizer::new(tokenizer_model);
+        tokenizer.with_pre_tokenizer(Some(Whitespace));
+
+        configure_minilm_tokenizer(&mut tokenizer).unwrap();
+
+        assert_eq!(
+            tokenizer.get_truncation().map(|params| params.max_length),
+            Some(MINILM_MAX_TOKENS)
+        );
+        let input = "token ".repeat(MINILM_MAX_TOKENS + 1);
+        let encoding = tokenizer.encode(input, true).unwrap();
+        assert_eq!(encoding.get_ids().len(), MINILM_MAX_TOKENS);
+        assert!(!encoding.get_overflowing().is_empty());
     }
 }
 
